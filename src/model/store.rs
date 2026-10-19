@@ -284,17 +284,50 @@ impl Store {
 
         for device in &snap.devices {
             attributed.extend(device.host_keys.iter());
-            let device_gone = device.gone;
             for sid in &device.services {
-                let service = &snap.services[sid];
-                attributed.extend(service.own_keys.iter());
-                let keep = service.retained || (device_gone && device.retained);
-                if !keep && (service.gone || device_gone) {
-                    remove.extend(service.own_keys.iter().cloned());
+                attributed.extend(snap.services[sid].own_keys.iter());
+            }
+            let services_of = |ids: &[String]| -> Vec<RecordKey> {
+                ids.iter()
+                    .flat_map(|sid| snap.services[sid].own_keys.iter().cloned())
+                    .collect()
+            };
+            if device.gone {
+                if device.retained {
+                    continue;
+                }
+                remove.extend(device.host_keys.iter().cloned());
+                let unretained: Vec<String> = device
+                    .services
+                    .iter()
+                    .filter(|sid| !snap.services[*sid].retained)
+                    .cloned()
+                    .collect();
+                remove.extend(services_of(&unretained));
+                continue;
+            }
+            // A live device: drop host names that went silent on their own,
+            // unless the selection still holds them; a held host keeps its
+            // services so it stays part of the device.
+            let mut held_services: HashSet<&String> = HashSet::new();
+            for member in &device.members {
+                let held = self.retained.contains(&member.id)
+                    || member.services.iter().any(|sid| snap.services[sid].retained);
+                if !member.gone {
+                    continue;
+                }
+                if held {
+                    held_services.extend(member.services.iter());
+                } else {
+                    remove.extend(member.host_keys.iter().cloned());
+                    remove.extend(services_of(&member.services));
                 }
             }
-            if device_gone && !device.retained {
-                remove.extend(device.host_keys.iter().cloned());
+            for sid in &device.services {
+                let service = &snap.services[sid];
+                if service.gone && !service.retained && !held_services.contains(sid) {
+                    remove.extend(service.own_keys.iter().cloned());
+                }
             }
         }
         // Records not part of any device: browse PTRs for types, device-info, ...

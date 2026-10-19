@@ -1,6 +1,7 @@
 //! Immutable view of the inventory, derived from the store's records.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
@@ -100,11 +101,24 @@ pub struct Service {
     pub(crate) own_keys: Vec<RecordKey>,
 }
 
+/// One host name of a device, for per-host garbage collection.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Member {
+    pub id: String,
+    pub host_keys: Vec<RecordKey>,
+    pub services: Vec<String>,
+    /// This host on its own is past the device timeout.
+    pub gone: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Device {
-    /// Host name key, or [`UNRESOLVED_ID`].
+    /// Key of the primary host name, or [`UNRESOLVED_ID`].
     pub id: String,
+    /// The primary host name.
     pub host: Option<DnsName>,
+    /// All host names of the device, primary first.
+    pub hosts: Vec<DnsName>,
     pub label: String,
     pub addresses: Vec<IpAddr>,
     /// Service ids sorted by display order.
@@ -113,7 +127,9 @@ pub struct Device {
     pub last_seen: Instant,
     pub retained: bool,
     pub gone: bool,
+    /// Records owned by any of the device's host names.
     pub(crate) host_keys: Vec<RecordKey>,
+    pub(crate) members: Vec<Member>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -243,6 +259,70 @@ struct DeviceBuilder {
     services: Vec<String>,
 }
 
+/// One host name with everything derived from it alone.
+struct HostView<'a> {
+    id: String,
+    host: Option<DnsName>,
+    services: Vec<String>,
+    host_entries: Vec<(&'a RecordKey, &'a StoredRecord)>,
+    label: String,
+    /// Addresses used to decide merging: live ones, else the last known.
+    merge_addresses: BTreeSet<IpAddr>,
+    last_seen: Instant,
+}
+
+/// Minimal union-find over host indices.
+struct UnionFind(Vec<usize>);
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self((0..n).collect())
+    }
+
+    fn find(&mut self, i: usize) -> usize {
+        let parent = self.0[i];
+        if parent == i {
+            return i;
+        }
+        let root = self.find(parent);
+        self.0[i] = root;
+        root
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra != rb {
+            self.0[rb] = ra;
+        }
+    }
+}
+
+/// Groups host names that share a label (ignoring case) and an address.
+fn group_hosts(hosts: &[HostView<'_>]) -> Vec<Vec<usize>> {
+    let mut uf = UnionFind::new(hosts.len());
+    let mut by_label: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, h) in hosts.iter().enumerate() {
+        if h.id != UNRESOLVED_ID && !h.merge_addresses.is_empty() {
+            by_label.entry(h.label.to_lowercase()).or_default().push(i);
+        }
+    }
+    for bucket in by_label.values() {
+        for (n, &a) in bucket.iter().enumerate() {
+            for &b in &bucket[n + 1..] {
+                if !hosts[a].merge_addresses.is_disjoint(&hosts[b].merge_addresses) {
+                    uf.union(a, b);
+                }
+            }
+        }
+    }
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in 0..hosts.len() {
+        let root = uf.find(i);
+        groups.entry(root).or_default().push(i);
+    }
+    groups.into_values().collect()
+}
+
 pub(crate) fn derive(input: &DeriveInput<'_>) -> Snapshot {
     // Service instances: browse PTR targets and SRV owners.
     let mut instances: BTreeMap<String, DnsName> = BTreeMap::new();
@@ -364,7 +444,7 @@ pub(crate) fn derive(input: &DeriveInput<'_>) -> Snapshot {
         }
     }
 
-    let mut device_list: Vec<Device> = devices
+    let host_views: Vec<HostView> = devices
         .into_iter()
         .map(|(id, builder)| {
             let host_entries: Vec<(&RecordKey, &StoredRecord)> = builder
@@ -372,34 +452,100 @@ pub(crate) fn derive(input: &DeriveInput<'_>) -> Snapshot {
                 .as_ref()
                 .map(|h| input.owned(h).collect())
                 .unwrap_or_default();
-            let host_records: Vec<&StoredRecord> = host_entries.iter().map(|(_, r)| *r).collect();
             let mut svc_ids = builder.services;
             sort_services(&mut svc_ids, &services);
-
-            let all_records = host_records.iter().copied().chain(
+            let records = host_entries.iter().map(|(_, r)| *r).chain(
                 svc_ids
                     .iter()
                     .flat_map(|s| services[s].own_keys.iter())
                     .filter_map(|k| input.records.get(k)),
             );
-            let state = input.liveness(all_records.clone());
-            let last_seen = input.last_seen(all_records);
-
-            let label = device_label(builder.host.as_ref(), &svc_ids, &services, &device_models);
-            Device {
-                retained: input.retained.contains(&id),
-                gone: input.is_gone(last_seen),
-                addresses: addresses_of(&host_records),
-                host_keys: host_entries.iter().map(|(k, _)| (*k).clone()).collect(),
+            let last_seen = input.last_seen(records);
+            let address_records = host_entries.iter().map(|(_, r)| *r).filter(|r| r.data.address().is_some());
+            let live: BTreeSet<IpAddr> = address_records
+                .clone()
+                .filter(|r| r.is_live(input.now))
+                .filter_map(|r| r.data.address())
+                .collect();
+            let merge_addresses = if live.is_empty() {
+                address_records.filter_map(|r| r.data.address()).collect()
+            } else {
+                live
+            };
+            HostView {
+                label: device_label(builder.host.as_ref(), &svc_ids, &services, &device_models),
                 id,
                 host: builder.host,
-                label,
                 services: svc_ids,
-                state,
+                host_entries,
+                merge_addresses,
                 last_seen,
             }
         })
         .collect();
+
+    let mut device_list: Vec<Device> = Vec::new();
+    for group in group_hosts(&host_views) {
+        let mut members: Vec<&HostView> = group.iter().map(|&i| &host_views[i]).collect();
+        // Primary first: most services, then the smallest key.
+        members.sort_by_key(|h| (Reverse(h.services.len()), h.id.clone()));
+        let primary = members[0];
+        let id = primary.id.clone();
+
+        let mut svc_ids: Vec<String> = members.iter().flat_map(|h| h.services.iter().cloned()).collect();
+        sort_services(&mut svc_ids, &services);
+        for sid in &svc_ids {
+            if let Some(s) = services.get_mut(sid) {
+                s.device_id = id.clone();
+            }
+        }
+        let host_records: Vec<&StoredRecord> = members
+            .iter()
+            .flat_map(|h| h.host_entries.iter().map(|(_, r)| *r))
+            .collect();
+        let all_records = host_records.iter().copied().chain(
+            svc_ids
+                .iter()
+                .flat_map(|s| services[s].own_keys.iter())
+                .filter_map(|k| input.records.get(k)),
+        );
+        let state = input.liveness(all_records.clone());
+        let last_seen = input.last_seen(all_records);
+
+        let mut hosts: Vec<DnsName> = vec![];
+        if let Some(h) = &primary.host {
+            hosts.push(h.clone());
+        }
+        let mut others: Vec<DnsName> = members[1..].iter().filter_map(|h| h.host.clone()).collect();
+        others.sort();
+        hosts.extend(others);
+
+        device_list.push(Device {
+            retained: members.iter().any(|h| input.retained.contains(&h.id)),
+            gone: input.is_gone(last_seen),
+            addresses: addresses_of(&host_records),
+            host_keys: members
+                .iter()
+                .flat_map(|h| h.host_entries.iter().map(|(k, _)| (*k).clone()))
+                .collect(),
+            members: members
+                .iter()
+                .map(|h| Member {
+                    id: h.id.clone(),
+                    host_keys: h.host_entries.iter().map(|(k, _)| (*k).clone()).collect(),
+                    services: h.services.clone(),
+                    gone: input.is_gone(h.last_seen),
+                })
+                .collect(),
+            label: primary.label.clone(),
+            host: primary.host.clone(),
+            hosts,
+            id,
+            services: svc_ids,
+            state,
+            last_seen,
+        });
+    }
     device_list.sort_by(|a, b| {
         a.label
             .to_lowercase()

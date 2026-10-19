@@ -94,7 +94,8 @@ async fn services_grouped_by_srv_target() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn shared_address_does_not_merge_hosts() {
+async fn shared_address_with_different_labels_does_not_merge() {
+    // Host-only devices are labelled by host name, so the labels differ.
     let mut store = Store::new(TIMEOUT);
     store.ingest(wire("nas.local", a(10), 120));
     store.ingest(wire("nas-2.local", a(10), 120));
@@ -420,4 +421,214 @@ async fn store_task_publishes_snapshots_and_queries() {
     handle.retain.send(vec![UNRESOLVED_ID.to_string()]).unwrap();
     handle.snapshots.changed().await.unwrap();
     assert!(handle.snapshots.borrow().devices[0].retained);
+}
+
+fn aaaa(text: &str) -> RData {
+    RData::Aaaa(text.parse().unwrap())
+}
+
+const SERVICE_TYPES: [&str; 8] = ["_airplay", "_companion-link", "_rfb", "_smb", "_ssh", "_sftp-ssh", "_raop", "_net-assistant"];
+
+/// The office Mac: 8 services on Hyperion.local, 1 on a UUID host name.
+fn hyperion(store: &mut Store, ttl: u32) {
+    for t in SERVICE_TYPES {
+        advertise(store, &format!("Hyperion.{t}._tcp.local"), "Hyperion.local", 1000, ttl);
+    }
+    advertise(store, "Hyperion._abm-mh-v2._tcp.local", "1e8da75b.local", 2000, ttl);
+    for host in ["Hyperion.local", "1e8da75b.local"] {
+        store.ingest(wire(host, a(147), ttl.min(120)));
+        store.ingest(wire(host, aaaa("fe80::c05:d0d4:84b1:b726"), ttl.min(120)));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_machine_under_two_host_names_is_merged() {
+    let mut store = Store::new(TIMEOUT);
+    hyperion(&mut store, 4500);
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 1, "{:?}", device_labels(&s));
+    let d = &s.devices[0];
+    assert_eq!(d.label, "Hyperion");
+    assert_eq!(d.id, "hyperion.local");
+    assert_eq!(d.services.len(), 9);
+    assert_eq!(d.hosts, vec![name("Hyperion.local"), name("1e8da75b.local")]);
+    assert_eq!(d.addresses.len(), 2);
+    assert!(s.services.values().all(|svc| svc.device_id == "hyperion.local"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_name_different_addresses_stay_separate() {
+    let mut store = Store::new(TIMEOUT);
+    advertise(&mut store, "Office Printer._ipp._tcp.local", "printer-a.local", 631, 4500);
+    advertise(&mut store, "Office Printer._http._tcp.local", "printer-b.local", 80, 4500);
+    store.ingest(wire("printer-a.local", a(40), 120));
+    store.ingest(wire("printer-b.local", a(41), 120));
+    assert_eq!(device_labels(&snap(&store)), vec!["Office Printer", "Office Printer"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn merge_waits_for_a_shared_address() {
+    let mut store = Store::new(TIMEOUT);
+    advertise(&mut store, "Hyperion._ssh._tcp.local", "Hyperion.local", 22, 4500);
+    advertise(&mut store, "Hyperion._smb._tcp.local", "Hyperion.local", 445, 4500);
+    advertise(&mut store, "Hyperion._abm-mh-v2._tcp.local", "1e8da75b.local", 2000, 4500);
+    store.ingest(wire("Hyperion.local", a(147), 120));
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 2);
+    assert!(s.device("hyperion.local").is_some() && s.device("1e8da75b.local").is_some());
+
+    store.ingest(wire("1e8da75b.local", a(147), 120));
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 1);
+    assert_eq!(s.devices[0].id, "hyperion.local", "id of the larger part is kept");
+}
+
+#[tokio::test(start_paused = true)]
+async fn merging_is_transitive() {
+    let mut store = Store::new(TIMEOUT);
+    for (i, host) in ["x1.local", "x2.local", "x3.local"].iter().enumerate() {
+        let t = ["_http", "_ssh", "_smb"][i];
+        advertise(&mut store, &format!("Box.{t}._tcp.local"), host, 1, 4500);
+        store.ingest(wire(host, a(10 + i as u8), 120));
+        store.ingest(wire(host, a(11 + i as u8), 120));
+    }
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 1);
+    assert_eq!(s.devices[0].hosts.len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unresolved_bucket_is_never_merged() {
+    let mut store = Store::new(TIMEOUT);
+    store.ingest(wire("_ipp._tcp.local", ptr("Lost._ipp._tcp.local"), 4500));
+    advertise(&mut store, "(unresolved)._http._tcp.local", "odd.local", 80, 4500);
+    store.ingest(wire("odd.local", a(5), 120));
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 2);
+    assert!(s.device(UNRESOLVED_ID).is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn merged_last_seen_is_the_latest_host() {
+    let mut store = Store::new(TIMEOUT);
+    hyperion(&mut store, 120);
+    advance(Duration::from_secs(110)).await;
+    store.ingest(wire("1e8da75b.local", a(147), 120));
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 1);
+    assert_eq!(s.devices[0].last_seen, Instant::now());
+}
+
+#[tokio::test(start_paused = true)]
+async fn merged_device_live_while_one_host_is_live() {
+    let mut store = Store::new(TIMEOUT);
+    hyperion(&mut store, 120);
+    advance(Duration::from_secs(100)).await;
+    store.ingest(wire("1e8da75b.local", a(147), 120));
+    advance(Duration::from_secs(30)).await; // Hyperion.local's records have expired
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 1);
+    let d = &s.devices[0];
+    assert_eq!(d.state, Liveness::Live);
+    let main_host = s.services["hyperion._ssh._tcp.local"].state;
+    assert_eq!(main_host, Liveness::Stale);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retention_through_a_member_host_key() {
+    let mut store = Store::new(TIMEOUT);
+    hyperion(&mut store, 4500);
+    store.set_retained(["1e8da75b.local".to_string()]);
+    assert!(snap(&store).devices[0].retained);
+}
+
+#[tokio::test(start_paused = true)]
+async fn address_change_splits_the_device() {
+    let mut store = Store::new(TIMEOUT);
+    hyperion(&mut store, 4500);
+    advance(Duration::from_secs(5)).await;
+    for data in [a(200), aaaa("fe80::1")] {
+        let Observation::Record(mut fresh) = wire("1e8da75b.local", data, 120) else {
+            unreachable!()
+        };
+        fresh.cache_flush = true;
+        store.ingest(Observation::Record(fresh));
+    }
+    advance(Duration::from_secs(2)).await;
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 2);
+    assert_eq!(s.device("hyperion.local").unwrap().services.len(), 8, "primary keeps its id");
+    assert_eq!(s.device("1e8da75b.local").unwrap().services.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_merged_device_stays_merged() {
+    let mut store = Store::new(TIMEOUT);
+    hyperion(&mut store, 4500);
+    advance(Duration::from_secs(200)).await; // address records (ttl 120) expired
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 1);
+    assert_eq!(s.devices[0].hosts.len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn silent_host_name_leaves_merged_device() {
+    let mut store = Store::new(TIMEOUT);
+    hyperion(&mut store, 120);
+    // Only Hyperion.local keeps answering.
+    for _ in 0..4 {
+        advance(Duration::from_secs(100)).await;
+        hyperion_main_answers(&mut store);
+    }
+    store.gc(Instant::now());
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 1);
+    let d = &s.devices[0];
+    assert_eq!(d.hosts, vec![name("Hyperion.local")]);
+    assert_eq!(d.services.len(), 8);
+    assert!(!s.services.contains_key("hyperion._abm-mh-v2._tcp.local"));
+}
+
+fn hyperion_main_answers(store: &mut Store) {
+    for t in SERVICE_TYPES {
+        advertise(store, &format!("Hyperion.{t}._tcp.local"), "Hyperion.local", 1000, 120);
+    }
+    store.ingest(wire("Hyperion.local", a(147), 120));
+}
+
+#[tokio::test(start_paused = true)]
+async fn selected_primary_host_is_kept_while_the_rest_answers() {
+    let mut store = Store::new(TIMEOUT);
+    hyperion(&mut store, 120);
+    store.set_retained(["hyperion.local".to_string()]);
+    // Only the secondary host keeps answering.
+    for _ in 0..4 {
+        advance(Duration::from_secs(100)).await;
+        advertise(&mut store, "Hyperion._abm-mh-v2._tcp.local", "1e8da75b.local", 2000, 120);
+        store.ingest(wire("1e8da75b.local", a(147), 120));
+    }
+    store.gc(Instant::now());
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 1);
+    assert_eq!(s.devices[0].id, "hyperion.local", "selection keeps its device id");
+    assert_eq!(s.devices[0].services.len(), 9, "the held host keeps its services");
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_gone_merged_device_kept_whole_until_released() {
+    let mut store = Store::new(TIMEOUT);
+    hyperion(&mut store, 120);
+    store.set_retained(["hyperion.local".to_string()]);
+    advance(Duration::from_secs(400)).await;
+    store.gc(Instant::now());
+    let s = snap(&store);
+    assert_eq!(s.devices.len(), 1);
+    assert!(s.devices[0].gone && s.devices[0].retained);
+    assert_eq!(s.devices[0].services.len(), 9);
+    assert_eq!(s.devices[0].hosts.len(), 2);
+
+    store.set_retained([]);
+    store.gc(Instant::now());
+    assert!(snap(&store).devices.is_empty());
+    assert_eq!(store.record_count(), 0);
 }

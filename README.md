@@ -45,6 +45,17 @@ host, with remaining and original TTL, cache-flush bit, source address,
 interface, which source reported it (`system`, `wire` or `both`) and when it
 was first and last seen.
 
+### One device, several host names
+
+Some machines advertise under more than one host name. For example, a Mac may
+use `Hyperion.local` for most services and a generated name for a management
+service. `mdnsview` shows such host names as **one device** when they have the
+same name (ignoring case) **and** share at least one IP address. The device
+lists the services of all its host names, and the service details show a
+`Device` line with every host name. Devices with the same name but no common
+address stay separate. If the host names stop sharing an address, the device
+splits again.
+
 ### How discovery works
 
 `mdnsview` combines two sources:

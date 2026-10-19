@@ -627,3 +627,112 @@ async fn m_is_text_while_editing_filter() {
     assert_eq!(a.filter, "mm");
     assert!(a.mouse);
 }
+
+fn aaaa_rec(host: &str) -> Observation {
+    wire(host, RData::Aaaa("fe80::c05:d0d4:84b1:b726".parse().unwrap()), 120)
+}
+
+/// Hyperion.local with two services; the UUID host with one, sharing an address
+/// only when `shared` is true.
+fn hyperion_lan(shared: bool) -> Store {
+    let mut store = lan();
+    advertise(&mut store, "Hyperion", "_ssh._tcp", "Hyperion.local", 22, &[]);
+    advertise(&mut store, "Hyperion", "_smb._tcp", "Hyperion.local", 445, &[]);
+    address(&mut store, "Hyperion.local", 147);
+    advertise(&mut store, "Hyperion", "_abm-mh-v2._tcp", "1e8da75b.local", 2000, &[]);
+    if shared {
+        store.ingest(aaaa_rec("Hyperion.local"));
+        store.ingest(aaaa_rec("1e8da75b.local"));
+    } else {
+        address(&mut store, "1e8da75b.local", 99);
+    }
+    store
+}
+
+fn select_device(a: &mut App, id: &str) {
+    a.focus = Focus::Left;
+    for _ in 0..20 {
+        if a.left.as_deref() == Some(id) {
+            return;
+        }
+        key(a, KeyCode::Down);
+    }
+    panic!("device {id} not reachable: {:?}", left_labels(a));
+}
+
+#[tokio::test(start_paused = true)]
+async fn selection_follows_a_merge() {
+    let mut store = hyperion_lan(false);
+    let mut a = app(&store);
+    select_device(&mut a, "1e8da75b.local");
+    store.ingest(aaaa_rec("Hyperion.local"));
+    store.ingest(aaaa_rec("1e8da75b.local"));
+    a.set_snapshot(Arc::new(store.snapshot(Instant::now())));
+    assert_eq!(a.left.as_deref(), Some("hyperion.local"));
+    assert_eq!(a.selected_device().unwrap().services.len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn selection_survives_a_split() {
+    let mut store = hyperion_lan(true);
+    let mut a = app(&store);
+    select_device(&mut a, "hyperion.local");
+    a.focus = Focus::Middle;
+    key(&mut a, KeyCode::Down);
+    let service = a.middle.clone();
+    // The UUID host announces new addresses with cache-flush.
+    advance(Duration::from_secs(5)).await;
+    for data in [
+        RData::A(Ipv4Addr::new(192, 168, 1, 99)),
+        RData::Aaaa("fe80::99".parse().unwrap()),
+    ] {
+        store.ingest(wire("1e8da75b.local", data, 120));
+    }
+    advance(Duration::from_secs(2)).await;
+    a.set_snapshot(Arc::new(store.snapshot(Instant::now())));
+    assert!(a.snapshot.device("1e8da75b.local").is_some(), "split happened");
+    assert_eq!(a.left.as_deref(), Some("hyperion.local"));
+    assert_eq!(service.as_deref(), Some("hyperion._smb._tcp.local"));
+    assert_eq!(a.middle, service, "the selected service stays selected");
+}
+
+#[tokio::test(start_paused = true)]
+async fn filter_matches_secondary_host_name() {
+    let store = hyperion_lan(true);
+    let mut a = app(&store);
+    key(&mut a, KeyCode::Char('/'));
+    keys(&mut a, "1e8da75b");
+    assert_eq!(left_labels(&a), vec!["hyperion.local"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn service_view_lists_hosts_of_merged_device() {
+    let store = hyperion_lan(true);
+    let mut a = app(&store);
+    select_device(&mut a, "hyperion.local");
+    let s = screen(&a);
+    assert!(s.contains("Device    Hyperion.local, 1e8da75b.local"), "{s}");
+
+    select_device(&mut a, "nas.local");
+    let s = screen(&a);
+    assert!(!s.contains("Device    "), "single-host device has no Device line: {s}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn device_details_list_all_hosts() {
+    let mut store = Store::new(TIMEOUT);
+    // Host-only devices with the same model label merge too.
+    for host in ["mini.local", "mini-2.local"] {
+        store.ingest(wire(host, RData::A(Ipv4Addr::new(10, 0, 0, 7)), 120));
+        store.ingest(wire(
+            &format!("{}._device-info._tcp.local", host.trim_end_matches(".local")),
+            RData::Txt(vec![b"model=Macmini9,1".to_vec()]),
+            4500,
+        ));
+    }
+    let a = app(&store);
+    assert_eq!(a.snapshot.devices.len(), 1);
+    let s = screen(&a);
+    assert!(s.contains("Hosts     mini-2.local"), "{s}");
+    assert!(s.contains("mini.local"), "{s}");
+}

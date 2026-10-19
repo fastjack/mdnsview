@@ -197,7 +197,7 @@ fn render_details(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
     };
     let lines = match (app.selected_service(), app.selected_device()) {
         (Some(s), _) => match app.detail {
-            DetailMode::Simple => simple_service(s, now),
+            DetailMode::Simple => simple_service(s, app.snapshot.device(&s.device_id), now),
             DetailMode::Raw => raw_records(&s.records),
         },
         (None, Some(d)) => device_details(d, now),
@@ -210,7 +210,7 @@ fn render_details(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
     frame.render_widget(paragraph, area);
 }
 
-fn simple_service(s: &Service, now: Instant) -> Vec<Line<'static>> {
+fn simple_service(s: &Service, device: Option<&Device>, now: Instant) -> Vec<Line<'static>> {
     let mut lines = vec![
         field("Name", s.name.clone()),
         field("Type", format!("{} ({})", s.type_label, s.service_type)),
@@ -219,6 +219,10 @@ fn simple_service(s: &Service, now: Instant) -> Vec<Line<'static>> {
             s.host.as_ref().map(|h| h.to_string()).unwrap_or_else(|| "(not resolved)".into()),
         ),
     ];
+    if let Some(d) = device.filter(|d| d.hosts.len() > 1) {
+        let hosts: Vec<String> = d.hosts.iter().map(|h| h.to_string()).collect();
+        lines.push(field("Device", hosts.join(", ")));
+    }
     if s.addresses.is_empty() {
         lines.push(field("Addresses", "-"));
     }
@@ -242,10 +246,13 @@ fn simple_service(s: &Service, now: Instant) -> Vec<Line<'static>> {
 }
 
 fn device_details(d: &Device, now: Instant) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        field("Device", d.label.clone()),
-        field("Host", d.host.as_ref().map(|h| h.to_string()).unwrap_or_else(|| "(not resolved)".into())),
-    ];
+    let mut lines = vec![field("Device", d.label.clone())];
+    if d.hosts.is_empty() {
+        lines.push(field("Hosts", "(not resolved)"));
+    }
+    for (i, h) in d.hosts.iter().enumerate() {
+        lines.push(field(if i == 0 { "Hosts" } else { "" }, h.to_string()));
+    }
     for (i, a) in d.addresses.iter().enumerate() {
         lines.push(field(if i == 0 { "Addresses" } else { "" }, a.to_string()));
     }

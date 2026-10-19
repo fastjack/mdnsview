@@ -128,7 +128,7 @@ impl App {
     fn device_matches(&self, d: &Device) -> bool {
         self.filter.is_empty()
             || self.matches(&d.label)
-            || d.host.as_ref().is_some_and(|h| self.matches(&h.to_string()))
+            || d.hosts.iter().any(|h| self.matches(&h.to_string()))
             || d.services.iter().any(|s| {
                 let s = &self.snapshot.services[s];
                 self.matches(&s.name) || self.matches(&s.service_type) || self.matches(&s.type_label)
@@ -205,6 +205,16 @@ impl App {
     /// Keeps selections pointing at visible entries; falls back to the first one.
     fn fix_selection(&mut self) {
         let left_ids: Vec<String> = self.left_items().iter().map(|i| i.id().to_string()).collect();
+        // A device id is a host key: after a merge, follow that host to its device.
+        if let Some(left) = &self.left
+            && !left_ids.contains(left)
+            && let Some(merged) = self.left_items().iter().find_map(|i| match i {
+                LeftItem::Device(d) if d.hosts.iter().any(|h| h.key() == left) => Some(d.id.clone()),
+                _ => None,
+            })
+        {
+            self.left = Some(merged);
+        }
         if !self.left.as_ref().is_some_and(|l| left_ids.contains(l)) {
             self.left = left_ids.first().cloned();
             self.middle = None;
