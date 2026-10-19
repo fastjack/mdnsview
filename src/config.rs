@@ -16,6 +16,8 @@ pub struct Config {
     pub device_timeout: Duration,
     pub interfaces: InterfaceConfig,
     pub ipv6: bool,
+    /// Whether mouse capture is on at startup.
+    pub mouse: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -33,6 +35,7 @@ impl Default for Config {
             device_timeout: DEFAULT_DEVICE_TIMEOUT,
             interfaces: InterfaceConfig::default(),
             ipv6: true,
+            mouse: true,
         }
     }
 }
@@ -122,6 +125,7 @@ mod tests {
         assert!(c.interfaces.include.is_empty());
         assert_eq!(c.interfaces.exclude, vec!["veth*"]);
         assert!(c.ipv6);
+        assert!(c.mouse);
     }
 
     #[test]
@@ -130,6 +134,12 @@ mod tests {
         assert_eq!(c.device_timeout, Duration::from_secs(600));
         assert_eq!(c.interfaces, InterfaceConfig::default());
         assert!(c.ipv6);
+        assert!(c.mouse);
+    }
+
+    #[test]
+    fn mouse_can_be_disabled() {
+        assert!(!parse("mouse = false").unwrap().mouse);
     }
 
     #[test]
@@ -184,5 +194,6 @@ mod tests {
         let end = start + readme[start..].find("```").unwrap();
         let c = parse(&readme[start..end]).unwrap();
         assert_eq!(c.device_timeout, Duration::from_secs(300));
+        assert!(c.mouse);
     }
 }

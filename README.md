@@ -21,12 +21,24 @@ from it.
 | Key | Action |
 |-----|--------|
 | `↑` `↓` / `k` `j` | Move within the focused pane (scroll in the details pane) |
-| `←` `→` / `h` `l` | Move focus between panes |
+| `←` `→` / `h` `l` | Move focus between panes (`enter` also moves right) |
 | `PgUp` `PgDn` | Move by ten entries |
 | `tab` | Switch the left pane between devices and service types |
 | `/` | Filter the left pane (`enter` applies, `esc` clears) |
 | `d` | Switch the details pane between the simple view and raw records |
+| `m` | Turn mouse capture off / on |
 | `q` / `ctrl-c` | Quit |
+
+With the mouse, click a row to select it (and focus its pane), click the
+details pane to focus it, and use the scroll wheel over any pane: it moves the
+selection in the two lists and scrolls the details. The status bar shows
+`mouse on` or `mouse off`.
+
+While the mouse is captured, your terminal's own click-and-drag text selection
+is unavailable. Press `m` to release the mouse and copy text (most terminals
+also allow selecting with `Shift` held), then `m` again to get mouse control
+back. Set `mouse = false` in the configuration to start with the mouse
+released.
 
 The raw records view lists every record mDNS reported for the service and its
 host, with remaining and original TTL, cache-flush bit, source address,
@@ -67,6 +79,10 @@ device_timeout = "5m"
 
 # Listen and query over IPv6 as well as IPv4.
 ipv6 = true
+
+# Capture the mouse at startup (click to select, wheel to scroll).
+# Press `m` to toggle it while running.
+mouse = true
 
 [interfaces]
 # Glob patterns of interfaces to use. Empty = every interface that is up,

@@ -6,11 +6,12 @@ use std::time::{Duration, SystemTime};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::style::Color;
 use tokio::time::{Instant, advance};
 
-use super::app::{App, DetailMode, Focus, Mode};
+use super::app::{App, DetailMode, Focus, HitMap, Mode};
 use super::view;
 use crate::model::record::{DnsName, Observation, ObservedRecord, RData, Source, SourceState};
 use crate::model::store::Store;
@@ -90,7 +91,11 @@ fn keys(app: &mut App, text: &str) {
 
 fn render(app: &App) -> Terminal<TestBackend> {
     let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
-    terminal.draw(|f| view::render(f, app, "avahi")).unwrap();
+    terminal
+        .draw(|f| {
+            view::render(f, app, "avahi");
+        })
+        .unwrap();
     terminal
 }
 
@@ -411,7 +416,7 @@ async fn retained_device_returns_in_place() {
 async fn status_bar_sources() {
     let mut store = lan();
     let s = screen(&app(&store));
-    assert!(s.contains("avahi + wire │ 1 interface │ 3 devices"), "{s}");
+    assert!(s.contains("avahi + wire │ 1 interface │ 3 devices │ mouse on"), "{s}");
 
     store.ingest(Observation::SourceStatus {
         source: Source::System,
@@ -428,4 +433,197 @@ async fn status_bar_sources() {
         state: SourceState::Unavailable("bind".into()),
     });
     assert!(screen(&app(&store)).contains("system only"));
+}
+
+/// 40 host-only devices `host00.local` .. `host39.local`.
+fn many_hosts() -> Store {
+    let mut store = Store::new(TIMEOUT);
+    for i in 0..40u8 {
+        address(&mut store, &format!("host{i:02}.local"), i);
+    }
+    store
+}
+
+fn hits(app: &App, width: u16, height: u16) -> HitMap {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut out = HitMap::default();
+    terminal
+        .draw(|f| {
+            out = view::render(f, app, "avahi");
+        })
+        .unwrap();
+    out
+}
+
+fn mouse(app: &mut App, hits: &HitMap, kind: MouseEventKind, column: u16, row: u16) {
+    app.on_mouse(
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        hits,
+    );
+}
+
+fn click(app: &mut App, hits: &HitMap, column: u16, row: u16) {
+    mouse(app, hits, MouseEventKind::Down(MouseButton::Left), column, row);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hit_map_matches_scrolled_list() {
+    let store = many_hosts();
+    let mut a = app(&store);
+    for _ in 0..19 {
+        key(&mut a, KeyCode::Down);
+    }
+    assert_eq!(a.left.as_deref(), Some("host19.local"));
+    // 12 rows: 11 for the panes (9 list rows inside the borders) + status bar.
+    let h = hits(&a, 120, 12);
+    assert_eq!(h.left, Rect::new(0, 0, 36, 11));
+    assert_eq!(h.left_rows, Rect::new(1, 1, 34, 9));
+    assert_eq!(h.left_offset, 11, "entry 20 shown on the last visible row");
+    assert_eq!(h.middle_offset, 0);
+    assert_eq!(h.right.x, h.middle.x + h.middle.width);
+}
+
+#[tokio::test(start_paused = true)]
+async fn click_selects_device() {
+    let store = lan();
+    let mut a = app(&store);
+    a.focus = Focus::Right;
+    let h = hits(&a, 160, 30);
+    click(&mut a, &h, h.left_rows.x + 2, h.left_rows.y + 1); // second row: NAS
+    assert_eq!(a.focus, Focus::Left);
+    assert_eq!(a.left.as_deref(), Some("nas.local"));
+    assert_eq!(a.middle.as_deref(), Some("nas._smb._tcp.local"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn click_selects_service() {
+    let store = lan();
+    let mut a = app(&store);
+    keys(&mut a, "jj"); // brother.local, two services
+    let h = hits(&a, 160, 30);
+    click(&mut a, &h, h.middle_rows.x + 2, h.middle_rows.y + 1);
+    assert_eq!(a.focus, Focus::Middle);
+    assert_eq!(a.middle, Some(a.middle_items()[1].id.clone()));
+    assert!(screen(&a).contains("Web server (HTTP) (_http._tcp)"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn click_below_last_row_or_on_border_only_focuses() {
+    let store = lan();
+    let mut a = app(&store);
+    key(&mut a, KeyCode::Char('j'));
+    a.focus = Focus::Middle;
+    let h = hits(&a, 160, 30);
+    click(&mut a, &h, h.left_rows.x + 2, h.left_rows.y + 10);
+    assert_eq!(a.focus, Focus::Left);
+    assert_eq!(a.left.as_deref(), Some("nas.local"));
+    a.focus = Focus::Middle;
+    click(&mut a, &h, h.left.x, h.left.y + 2); // left border
+    assert_eq!(a.focus, Focus::Left);
+    assert_eq!(a.left.as_deref(), Some("nas.local"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn click_in_scrolled_list() {
+    let store = many_hosts();
+    let mut a = app(&store);
+    for _ in 0..27 {
+        key(&mut a, KeyCode::Down);
+    }
+    let h = hits(&a, 120, 12);
+    assert_eq!(h.left_offset, 19, "first visible row is the 20th device");
+    click(&mut a, &h, h.left_rows.x + 1, h.left_rows.y);
+    assert_eq!(a.left.as_deref(), Some("host19.local"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn click_details_focuses_it() {
+    let store = lan();
+    let mut a = app(&store);
+    let h = hits(&a, 160, 30);
+    click(&mut a, &h, h.right.x + 5, h.right.y + 3);
+    assert_eq!(a.focus, Focus::Right);
+    assert_eq!(a.left.as_deref(), Some("tv.local"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn wheel_over_device_list_keeps_focus() {
+    let store = lan();
+    let mut a = app(&store);
+    a.focus = Focus::Right;
+    let h = hits(&a, 160, 30);
+    mouse(&mut a, &h, MouseEventKind::ScrollDown, h.left.x + 3, h.left.y + 3);
+    assert_eq!(a.left.as_deref(), Some("nas.local"));
+    assert_eq!(a.focus, Focus::Right);
+    mouse(&mut a, &h, MouseEventKind::ScrollUp, h.left.x + 3, h.left.y + 3);
+    assert_eq!(a.left.as_deref(), Some("tv.local"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn wheel_over_details_scrolls_one_line() {
+    let store = lan();
+    let mut a = app(&store);
+    keys(&mut a, "jjd");
+    let h = hits(&a, 160, 30);
+    mouse(&mut a, &h, MouseEventKind::ScrollDown, h.right.x + 5, h.right.y + 5);
+    mouse(&mut a, &h, MouseEventKind::ScrollDown, h.right.x + 5, h.right.y + 5);
+    assert_eq!(a.detail_scroll, 2);
+    assert_eq!(a.focus, Focus::Left);
+    let first_line = screen(&a).lines().nth(1).unwrap().to_string();
+    assert!(!first_line.contains("PTR   _ipp._tcp.local"), "content moved up: {first_line}");
+    mouse(&mut a, &h, MouseEventKind::ScrollUp, h.right.x + 5, h.right.y + 5);
+    assert_eq!(a.detail_scroll, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn other_mouse_events_are_ignored() {
+    let store = lan();
+    let mut a = app(&store);
+    let h = hits(&a, 160, 30);
+    let (x, y) = (h.left_rows.x + 2, h.left_rows.y + 2);
+    for kind in [
+        MouseEventKind::Down(MouseButton::Right),
+        MouseEventKind::Down(MouseButton::Middle),
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Moved,
+    ] {
+        mouse(&mut a, &h, kind, x, y);
+    }
+    assert_eq!(a.focus, Focus::Left);
+    assert_eq!(a.left.as_deref(), Some("tv.local"));
+    // Outside every pane (status bar) nothing happens either.
+    a.focus = Focus::Middle;
+    click(&mut a, &h, 3, 29);
+    assert_eq!(a.focus, Focus::Middle);
+}
+
+#[tokio::test(start_paused = true)]
+async fn m_toggles_mouse_and_status_bar_shows_it() {
+    let store = lan();
+    let mut a = app(&store);
+    assert!(a.mouse);
+    assert!(screen(&a).contains("mouse on"));
+    key(&mut a, KeyCode::Char('m'));
+    assert!(!a.mouse);
+    let s = screen(&a);
+    assert!(s.contains("mouse off"), "{s}");
+    assert!(s.contains("m mouse"), "{s}");
+    key(&mut a, KeyCode::Char('m'));
+    assert!(a.mouse);
+}
+
+#[tokio::test(start_paused = true)]
+async fn m_is_text_while_editing_filter() {
+    let store = lan();
+    let mut a = app(&store);
+    key(&mut a, KeyCode::Char('/'));
+    keys(&mut a, "mm");
+    assert_eq!(a.filter, "mm");
+    assert!(a.mouse);
 }

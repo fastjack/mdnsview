@@ -22,6 +22,7 @@ When no configuration file exists, the system SHALL run with these defaults:
 - device timeout of 5 minutes
 - automatic interface selection with `veth*` excluded
 - IPv6 enabled
+- mouse capture enabled
 
 #### Scenario: No config file
 - **WHEN** no configuration file exists
@@ -33,6 +34,7 @@ The configuration SHALL support:
 - `interfaces.include`: a list of interface-name glob patterns; empty means automatic selection
 - `interfaces.exclude`: a list of interface-name glob patterns
 - `ipv6`: a boolean
+- `mouse`: a boolean; whether mouse capture is on at startup
 
 Settings that are omitted SHALL keep their defaults. Setting `interfaces.exclude` SHALL replace the default exclude list.
 
@@ -43,6 +45,10 @@ Settings that are omitted SHALL keep their defaults. Setting `interfaces.exclude
 #### Scenario: Custom exclude list
 - **WHEN** the file sets `interfaces.exclude = ["docker*", "veth*"]`
 - **THEN** interfaces matching either pattern are not used
+
+#### Scenario: Mouse disabled
+- **WHEN** the file sets `mouse = false`
+- **THEN** the application starts with mouse capture off
 
 ### Requirement: Invalid configuration
 If the configuration file cannot be parsed, or contains an invalid value, the system SHALL exit before starting the UI. The non-zero exit SHALL come with an error message that names the file and the offending setting.

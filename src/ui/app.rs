@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 
 use crate::model::snapshot::{Device, Service, ServiceType, Snapshot};
 
@@ -23,6 +26,40 @@ pub enum Focus {
 pub enum DetailMode {
     Simple,
     Raw,
+}
+
+/// Where the last frame put the panes, for mouse hit-testing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HitMap {
+    pub left: Rect,
+    pub middle: Rect,
+    pub right: Rect,
+    /// Row areas of the two lists (inside their borders).
+    pub left_rows: Rect,
+    pub middle_rows: Rect,
+    /// Index of the first visible entry of each list.
+    pub left_offset: usize,
+    pub middle_offset: usize,
+}
+
+impl HitMap {
+    fn pane_at(&self, pos: Position) -> Option<Focus> {
+        [(self.left, Focus::Left), (self.middle, Focus::Middle), (self.right, Focus::Right)]
+            .into_iter()
+            .find(|(area, _)| area.contains(pos))
+            .map(|(_, pane)| pane)
+    }
+
+    /// The entry index under `pos` in a list pane, if `pos` is on a row.
+    fn row_at(&self, pane: Focus, pos: Position) -> Option<usize> {
+        let (rows, offset) = match pane {
+            Focus::Left => (self.left_rows, self.left_offset),
+            Focus::Middle => (self.middle_rows, self.middle_offset),
+            Focus::Right => return None,
+        };
+        rows.contains(pos)
+            .then(|| offset + usize::from(pos.y - rows.y))
+    }
 }
 
 /// An entry of the left pane.
@@ -51,6 +88,8 @@ pub struct App {
     pub middle: Option<String>,
     pub detail_scroll: u16,
     pub quit: bool,
+    /// Whether mouse capture should be on.
+    pub mouse: bool,
 }
 
 impl App {
@@ -66,6 +105,7 @@ impl App {
             middle: None,
             detail_scroll: 0,
             quit: false,
+            mouse: true,
         };
         app.fix_selection();
         app
@@ -215,6 +255,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('m') => self.mouse = !self.mouse,
             KeyCode::Char('/') => self.editing_filter = true,
             KeyCode::Esc => {
                 self.filter.clear();
@@ -228,10 +269,10 @@ impl App {
                 };
                 self.detail_scroll = 0;
             }
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::PageUp => self.move_selection(-10),
-            KeyCode::PageDown => self.move_selection(10),
+            KeyCode::Up | KeyCode::Char('k') => self.move_in(self.focus, -1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_in(self.focus, 1),
+            KeyCode::PageUp => self.move_in(self.focus, -10),
+            KeyCode::PageDown => self.move_in(self.focus, 10),
             KeyCode::Left | KeyCode::Char('h') => {
                 self.focus = match self.focus {
                     Focus::Right => Focus::Middle,
@@ -248,31 +289,70 @@ impl App {
         }
     }
 
-    fn move_selection(&mut self, delta: isize) {
-        match self.focus {
+    /// Mouse clicks select and focus; the wheel acts on the pane under the pointer.
+    pub fn on_mouse(&mut self, event: MouseEvent, hits: &HitMap) {
+        let pos = Position::new(event.column, event.row);
+        let Some(pane) = hits.pane_at(pos) else {
+            return;
+        };
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.focus = pane;
+                if let Some(index) = hits.row_at(pane, pos) {
+                    self.select_index(pane, index);
+                }
+            }
+            MouseEventKind::ScrollUp => self.move_in(pane, -1),
+            MouseEventKind::ScrollDown => self.move_in(pane, 1),
+            _ => {}
+        }
+    }
+
+    fn pane_ids(&self, pane: Focus) -> Vec<String> {
+        match pane {
+            Focus::Left => self.left_items().iter().map(|i| i.id().to_string()).collect(),
+            Focus::Middle => self.middle_items().iter().map(|s| s.id.clone()).collect(),
+            Focus::Right => Vec::new(),
+        }
+    }
+
+    fn select(&mut self, pane: Focus, id: String) {
+        match pane {
             Focus::Left => {
-                let ids: Vec<String> = self.left_items().iter().map(|i| i.id().to_string()).collect();
-                if let Some(next) = step(&ids, self.left.as_deref(), delta)
-                    && self.left.as_ref() != Some(&next)
-                {
-                    self.left = Some(next);
+                if self.left.as_ref() != Some(&id) {
+                    self.left = Some(id);
                     self.middle = None;
                 }
             }
-            Focus::Middle => {
-                let ids: Vec<String> = self.middle_items().iter().map(|s| s.id.clone()).collect();
-                if let Some(next) = step(&ids, self.middle.as_deref(), delta) {
-                    self.middle = Some(next);
-                }
-            }
-            Focus::Right => {
-                let scroll = i64::from(self.detail_scroll) + delta as i64;
-                self.detail_scroll = scroll.clamp(0, i64::from(u16::MAX)) as u16;
-                return;
-            }
+            Focus::Middle => self.middle = Some(id),
+            Focus::Right => return,
         }
         self.detail_scroll = 0;
         self.fix_selection();
+    }
+
+    /// Selects the entry at `index` of a list pane, if there is one.
+    fn select_index(&mut self, pane: Focus, index: usize) {
+        if let Some(id) = self.pane_ids(pane).into_iter().nth(index) {
+            self.select(pane, id);
+        }
+    }
+
+    /// Moves the selection of a list pane, or scrolls the details pane.
+    fn move_in(&mut self, pane: Focus, delta: isize) {
+        if pane == Focus::Right {
+            let scroll = i64::from(self.detail_scroll) + delta as i64;
+            self.detail_scroll = scroll.clamp(0, i64::from(u16::MAX)) as u16;
+            return;
+        }
+        let ids = self.pane_ids(pane);
+        let current = match pane {
+            Focus::Left => self.left.as_deref(),
+            _ => self.middle.as_deref(),
+        };
+        if let Some(next) = step(&ids, current, delta) {
+            self.select(pane, next);
+        }
     }
 
     /// Switches the left pane between devices and service types, keeping the

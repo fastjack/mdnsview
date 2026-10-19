@@ -104,5 +104,5 @@ async fn run(config: Config) -> Result<()> {
         }
     }
 
-    ui::run(store, system_name).await
+    ui::run(store, system_name, config.mouse).await
 }

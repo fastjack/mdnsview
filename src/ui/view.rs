@@ -9,14 +9,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, Wrap};
 use tokio::time::Instant;
 
-use super::app::{App, DetailMode, Focus, LeftItem, Mode};
+use super::app::{App, DetailMode, Focus, HitMap, LeftItem, Mode};
 use crate::model::record::{RData, rtype};
 use crate::model::snapshot::{Device, Liveness, RecordView, Service, txt_entries};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const KEY: Style = Style::new().fg(Color::Cyan);
 
-pub fn render(frame: &mut Frame, app: &App, system_name: &str) {
+/// Draws the UI and returns where the panes and list rows ended up.
+pub fn render(frame: &mut Frame, app: &App, system_name: &str) -> HitMap {
     let [main, status] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
     let [left, middle, right] = Layout::horizontal([
         Constraint::Percentage(30),
@@ -25,10 +26,19 @@ pub fn render(frame: &mut Frame, app: &App, system_name: &str) {
     ])
     .areas(main);
     let now = Instant::now();
-    render_left(frame, app, left, now);
-    render_middle(frame, app, middle, now);
+    let (left_rows, left_offset) = render_left(frame, app, left, now);
+    let (middle_rows, middle_offset) = render_middle(frame, app, middle, now);
     render_details(frame, app, right, now);
     render_status(frame, app, status, system_name);
+    HitMap {
+        left,
+        middle,
+        right,
+        left_rows,
+        middle_rows,
+        left_offset,
+        middle_offset,
+    }
 }
 
 fn block(title: &str, focused: bool) -> Block<'static> {
@@ -83,19 +93,29 @@ fn age_text(gone: bool, state: Liveness, age: Duration) -> String {
     }
 }
 
-fn render_list(frame: &mut Frame, area: Rect, block: Block<'_>, items: Vec<ListItem<'_>>, selected: Option<usize>, focused: bool) {
+/// Returns the rows area and the scroll offset ratatui chose.
+fn render_list(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block<'_>,
+    items: Vec<ListItem<'_>>,
+    selected: Option<usize>,
+    focused: bool,
+) -> (Rect, usize) {
     let highlight = if focused {
         Style::new().add_modifier(Modifier::REVERSED)
     } else {
         Style::new().add_modifier(Modifier::BOLD).bg(Color::DarkGray)
     };
     let empty = items.is_empty();
+    let rows = block.inner(area);
     let list = List::new(items).block(block).highlight_style(highlight);
     let mut state = ListState::default().with_selected(if empty { None } else { selected });
     frame.render_stateful_widget(list, area, &mut state);
+    (rows, state.offset())
 }
 
-fn render_left(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
+fn render_left(frame: &mut Frame, app: &App, area: Rect, now: Instant) -> (Rect, usize) {
     let width = area.width.saturating_sub(2) as usize;
     let items = app.left_items();
     let selected = items.iter().position(|i| Some(i.id()) == app.left.as_deref());
@@ -116,10 +136,10 @@ fn render_left(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
         Mode::Devices => "Devices",
         Mode::Types => "Service types",
     };
-    render_list(frame, area, block(title, app.focus == Focus::Left), rows, selected, app.focus == Focus::Left);
+    render_list(frame, area, block(title, app.focus == Focus::Left), rows, selected, app.focus == Focus::Left)
 }
 
-fn render_middle(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
+fn render_middle(frame: &mut Frame, app: &App, area: Rect, now: Instant) -> (Rect, usize) {
     let width = area.width.saturating_sub(2) as usize;
     let items = app.middle_items();
     let selected = items.iter().position(|s| Some(&s.id) == app.middle.as_ref());
@@ -148,7 +168,7 @@ fn render_middle(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
         Mode::Devices => "Services",
         Mode::Types => "Instances",
     };
-    render_list(frame, area, block(title, app.focus == Focus::Middle), rows, selected, app.focus == Focus::Middle);
+    render_list(frame, area, block(title, app.focus == Focus::Middle), rows, selected, app.focus == Focus::Middle)
 }
 
 fn field(name: &str, value: impl Into<String>) -> Line<'static> {
@@ -363,10 +383,12 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, system_name: &str) {
     spans.push(Span::styled(" │ ", DIM));
     spans.push(Span::raw(format!("{devices} device{}", if devices == 1 { "" } else { "s" })));
     spans.push(Span::styled(" │ ", DIM));
+    spans.push(Span::raw(if app.mouse { "mouse on" } else { "mouse off" }));
+    spans.push(Span::styled(" │ ", DIM));
     let hints: &[(&str, &str)] = if app.editing_filter {
         &[("enter", "apply"), ("esc", "clear")]
     } else {
-        &[("tab", "pivot"), ("/", "filter"), ("d", "details"), ("q", "quit")]
+        &[("tab", "pivot"), ("/", "filter"), ("d", "details"), ("m", "mouse"), ("q", "quit")]
     };
     for (i, (key, what)) in hints.iter().enumerate() {
         if i > 0 {
