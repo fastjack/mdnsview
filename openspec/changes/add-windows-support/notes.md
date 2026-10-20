@@ -100,7 +100,7 @@ Run with `cargo test live_windns_raw -- --ignored --nocapture` (40 s, `_ipp._tcp
 
 - **Windows 11 23H2 (build 22631), x86_64, Rust 1.99.1.** `cargo clippy --all-targets -- -D warnings` is clean. `cargo test` passes 159 tests, with 5 ignored: `live_windns`, `live_windns_goodbye`, `live_wire`, `live_wire_ifindex` and `live_windows_interfaces`. All five ignored tests passed when run by hand during this change. `cargo build --release` succeeds.
 - **Linux (Docker `rust:latest`, Rust 1.99.1, aarch64).** `cargo clippy --all-targets --locked -- -D warnings` is clean. `cargo test --locked` passes 132 tests, with 3 ignored: `live_avahi`, `live_wire` and `live_wire_ifindex`.
-- **macOS: open.** The Apple target is not installed on the PC. `cargo test` on the Mac is still needed, mainly for the `names.rs` move (task 4.2).
+- **macOS (user, on a separate Mac, branch `add-windows-support` at `0979bcf`).** `cargo test` passes and `cargo clippy --all-targets -- -D warnings` is clean, so the `names.rs` move (task 4.2) also builds there.
 
 ## Manual checks (tasks 3.3, 4.5, 5.3, 7.1)
 
@@ -109,4 +109,4 @@ Run with `cargo test live_windns_raw -- --ignored --nocapture` (40 s, `_ipp._tcp
 - **Daemon unavailable.** Stopping Dnscache needs administrator rights, so it was not done. The unavailable path is covered by `missing_api_is_reported_unavailable` (backend) and the `wire only` label tests (UI).
 - **Firewall (user).** After 60 s without an allow rule, no firewall hint appeared. The user then added the README's `New-NetFirewallRule` command in an elevated PowerShell and deleted the two Block rules. `Get-NetFirewallApplicationFilter` now shows only Allow rules for `target\release\mdnsview.exe`. The hint itself cannot be triggered here; unit tests cover it.
 - **UI (user).** In Windows Terminal, keys, mouse, `m`, colors, box drawing and quitting all work. The classic console was not checked; the user reports it is no longer available on this Windows 11.
-- **macOS.** The user will run `cargo test` on a Mac after the change is pushed (task 8.1).
+- **macOS.** Checked by the user after the push; see the integration section above.

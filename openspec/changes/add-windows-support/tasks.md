@@ -109,7 +109,7 @@
 
 ## 8. Integration
 
-- [ ] 8.1 On Windows, run `cargo clippy --all-targets -- -D warnings` and `cargo test`. On Linux (Docker `rust:latest`), run `cargo clippy --all-targets --locked -- -D warnings` and `cargo test --locked`. If an Apple target is installed, also run `cargo check --target aarch64-apple-darwin`; otherwise ask the user to run `cargo test` on the Mac. Record the test counts per platform and the Windows build in `notes.md`.
+- [x] 8.1 On Windows, run `cargo clippy --all-targets -- -D warnings` and `cargo test`. On Linux (Docker `rust:latest`), run `cargo clippy --all-targets --locked -- -D warnings` and `cargo test --locked`. If an Apple target is installed, also run `cargo check --target aarch64-apple-darwin`; otherwise ask the user to run `cargo test` on the Mac. Record the test counts per platform and the Windows build in `notes.md`.
 - [x] 8.2 Run `openspec validate add-windows-support --strict` and verify that it passes.
 
 ## Workflow follow-up
