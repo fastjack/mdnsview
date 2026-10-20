@@ -26,6 +26,11 @@ pub struct Status {
     pub system: SourceState,
     pub wire: SourceState,
     pub interfaces: Vec<String>,
+    /// The wire source reports that it hears no other host.
+    pub wire_silent: bool,
+    /// The OS daemon holds at least one service instance. Set when a
+    /// snapshot is derived.
+    pub system_services: bool,
 }
 
 impl Default for Status {
@@ -34,6 +39,8 @@ impl Default for Status {
             system: SourceState::Starting,
             wire: SourceState::Starting,
             interfaces: Vec::new(),
+            wire_silent: false,
+            system_services: false,
         }
     }
 }
@@ -54,9 +61,17 @@ impl Status {
         };
         if self.wire == SourceState::Unavailable(LOCAL_NETWORK_BLOCKED.into()) {
             format!("{label} (Local Network access blocked)")
+        } else if self.firewall_hint() {
+            format!("{label} (no replies: check Windows Firewall)")
         } else {
             label
         }
+    }
+
+    /// Our queries go out and the OS daemon finds services, but no other
+    /// host answers the wire source: incoming mDNS is probably blocked.
+    fn firewall_hint(&self) -> bool {
+        self.wire_silent && self.system == SourceState::Active && self.system_services
     }
 
     pub fn system_only(&self) -> bool {
@@ -703,7 +718,12 @@ pub(crate) fn derive(input: &DeriveInput<'_>) -> Snapshot {
         devices: device_list,
         types,
         services,
-        status: input.status.clone(),
+        status: Status {
+            system_services: input.records.values().any(|r| {
+                r.held_by_system && matches!(&r.data, RData::Ptr(target) if target.is_service_instance())
+            }),
+            ..input.status.clone()
+        },
     }
 }
 

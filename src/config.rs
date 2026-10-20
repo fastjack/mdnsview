@@ -197,7 +197,10 @@ mod tests {
     #[test]
     fn readme_example_parses() {
         let readme = include_str!("../README.md");
-        let start = readme.find("```toml\n").expect("README has a toml example") + 8;
+        // Skip to the end of the fence line, which ends in CRLF in a Windows checkout.
+        let section = readme.find("## Configuration").expect("README has a configuration section");
+        let fence = section + readme[section..].find("```toml").expect("README has a toml example");
+        let start = fence + readme[fence..].find('\n').unwrap() + 1;
         let end = start + readme[start..].find("```").unwrap();
         let c = parse(&readme[start..end]).unwrap();
         assert_eq!(c.device_timeout, Duration::from_secs(300));

@@ -10,6 +10,9 @@ cargo build --release
 ./target/release/mdnsview --config ./my-config.toml
 ```
 
+On Windows, run `.\target\release\mdnsview.exe` in Windows Terminal or a
+console window.
+
 The screen has three panes: **devices** on the left, the selected device's
 **services** in the middle, and the selected service's **details** on the
 right. Everything refreshes in the background. Each device shows how long ago
@@ -69,25 +72,27 @@ device with its own port, addresses and TXT data. The service details show a
 `mdnsview` combines two sources:
 
 - **The OS mDNS daemon** for a quick first overview: avahi on Linux (over
-  D-Bus), mDNSResponder on macOS (through the system `dns_sd` API).
+  D-Bus), mDNSResponder on macOS (through the system `dns_sd` API), and the
+  DNS Client service on Windows (through the Windows DNS-SD API).
 - **Its own multicast socket** on UDP port 5353, IPv4 and IPv6. It listens to
   all mDNS traffic and sends its own queries to fill in details and to check
   that known hosts are still there.
 
-No root privileges are needed. The socket shares port 5353 with the daemon
-(`SO_REUSEADDR` / `SO_REUSEPORT`), so both keep working. With both sources
-active, the status bar shows `avahi + wire` or `mDNSResponder + wire`. If the
-daemon is not running, it shows `wire only`; if the port cannot be shared, it
-shows `system only`. If neither works, `mdnsview` exits with an error naming
-both problems.
+No root or administrator rights are needed. The socket shares port 5353 with
+the daemon (`SO_REUSEADDR` / `SO_REUSEPORT`), so both keep working. With both
+sources active, the status bar shows `avahi + wire`, `mDNSResponder + wire` or
+`Windows DNS + wire`. If the daemon is not running, it shows `wire only`; if
+the port cannot be shared, it shows `system only`. If neither works,
+`mdnsview` exits with an error naming both problems.
 
-Logs are written to `~/.local/state/mdnsview/mdnsview.log` on Linux and
-`~/Library/Caches/mdnsview/mdnsview.log` on macOS; set
+Logs are written to `~/.local/state/mdnsview/mdnsview.log` on Linux,
+`~/Library/Caches/mdnsview/mdnsview.log` on macOS and
+`%LOCALAPPDATA%\mdnsview\cache\mdnsview.log` on Windows; set
 `RUST_LOG=mdnsview=debug` for more detail.
 
 ### macOS
 
-`mdnsview` runs on macOS as well as on Linux. On macOS:
+`mdnsview` runs on macOS as well as on Linux and Windows. On macOS:
 
 - When `mdnsview` is started from a terminal, macOS does not apply its
   **Local Network** privacy setting to it, so nothing needs to be allowed.
@@ -100,11 +105,49 @@ Logs are written to `~/.local/state/mdnsview/mdnsview.log` on Linux and
 - The configuration file is
   `~/Library/Application Support/mdnsview/config.toml`.
 
+### Windows
+
+`mdnsview` runs on Windows 10 and 11, next to Windows' own DNS Client
+service. On Windows:
+
+- **Windows Firewall** allows incoming mDNS only for the DNS Client service.
+  The first start of `mdnsview.exe` may show a firewall prompt. Without an
+  allow rule (including when the prompt is cancelled, which adds a block
+  rule), Windows still lets in the answers to `mdnsview`'s own queries, but
+  drops announcements that other hosts send unprompted. Windows DNS still
+  reports new and departing services right away; only their wire records
+  (with TTL, source address and interface) wait for the next query. To let
+  all mDNS in, run this in an elevated PowerShell:
+
+  ```powershell
+  New-NetFirewallRule -DisplayName "mdnsview (mDNS-In)" -Direction Inbound `
+    -Protocol UDP -LocalPort 5353 -Action Allow `
+    -Program "C:\path\to\mdnsview.exe"
+  ```
+
+  If a firewall drops the answers too, so that no other host is heard while
+  Windows DNS lists services, the status bar shows
+  `(no replies: check Windows Firewall)`. `mdnsview` never changes firewall
+  settings itself.
+- **Interface names** are the connection names Windows shows, such as `WLAN`,
+  `Ethernet 2` or `vEthernet (WSL)`. They are localized and can be renamed;
+  `Get-NetAdapter -IncludeHidden` lists them (Hyper-V and WSL switches are
+  hidden without `-IncludeHidden`). To skip those switches and a VPN:
+
+  ```toml
+  [interfaces]
+  exclude = ["vEthernet (*", "Tailscale"]
+  ```
+- The configuration file is `%APPDATA%\mdnsview\config\config.toml`, and the
+  log is `%LOCALAPPDATA%\mdnsview\cache\mdnsview.log`.
+
 ## Configuration
 
 `mdnsview` reads `config.toml` from the platform configuration directory:
 `$XDG_CONFIG_HOME/mdnsview/config.toml` (usually `~/.config/mdnsview/config.toml`)
-on Linux, and `~/Library/Application Support/mdnsview/config.toml` on macOS. Use `--config <path>` to read a different file. Without a file, the
+on Linux, `~/Library/Application Support/mdnsview/config.toml` on macOS, and
+`%APPDATA%\mdnsview\config\config.toml` on Windows. Use `--config <path>` to read
+a different file. Without a file, the
 defaults below apply. Every setting is optional; unknown keys and invalid values
 are reported and the program exits before starting.
 

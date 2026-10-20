@@ -91,6 +91,10 @@ impl Store {
                 self.status.interfaces = names;
                 Vec::new()
             }
+            Observation::WireSilent(silent) => {
+                self.status.wire_silent = silent;
+                Vec::new()
+            }
         }
     }
 

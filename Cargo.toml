@@ -13,7 +13,6 @@ globset = "0.4.20"
 humantime = "2.4.0"
 humantime-serde = "1.1.1"
 libc = "0.2.191"
-nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
 rand = "0.10.3"
 ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -24,6 +23,20 @@ toml = "1.1.8"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_Dns",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "6.0.0", default-features = false, features = ["tokio"] }

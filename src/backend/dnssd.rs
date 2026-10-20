@@ -19,12 +19,12 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use super::names::{domain_or_local, instance_name, parse_presentation};
 use super::{BoxFuture, SystemBackend};
 use crate::model::record::{DnsName, Observation, ObservedRecord, RData, Source, SourceState};
 
 /// How often the loop checks whether the observation channel has closed.
 const POLL_TIMEOUT_MS: i32 = 250;
-const DEFAULT_DOMAIN: &str = "local";
 
 /// Declarations from the macOS SDK's `dns_sd.h`. `DNSSD_API` is the default
 /// C ABI on Apple platforms.
@@ -380,15 +380,6 @@ impl Tracker {
     }
 }
 
-/// `<instance>.<regtype>.<domain>`, with `name` as one label even if it
-/// contains dots.
-fn instance_name(name: &str, regtype: &str, domain: &str) -> DnsName {
-    let mut labels = vec![name.to_string()];
-    labels.extend(DnsName::parse(regtype).labels().iter().cloned());
-    labels.extend(domain_or_local(domain).labels().iter().cloned());
-    DnsName::from_labels(labels)
-}
-
 /// The type name and domain from a `_services._dns-sd._udp` browse result:
 /// `_ipp` + `_tcp.local.` → (`_ipp._tcp.local`, `local`).
 fn service_type(name: &str, regtype: &str) -> Option<(DnsName, DnsName)> {
@@ -402,52 +393,6 @@ fn service_type(name: &str, regtype: &str) -> Option<(DnsName, DnsName)> {
         .into_iter()
         .chain(domain.labels().iter().cloned());
     Some((DnsName::from_labels(labels), domain))
-}
-
-fn domain_or_local(domain: &str) -> DnsName {
-    let parsed = DnsName::parse(domain);
-    if parsed.labels().is_empty() {
-        DnsName::parse(DEFAULT_DOMAIN)
-    } else {
-        parsed
-    }
-}
-
-/// Parses a name in DNS presentation format as the daemon returns it:
-/// `\DDD` is a decimal byte and `\c` a literal character.
-fn parse_presentation(text: &str) -> DnsName {
-    let bytes = text.as_bytes();
-    let mut labels = Vec::new();
-    let mut current = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => {
-                let digits = bytes.get(i + 1..i + 4).filter(|d| d.iter().all(u8::is_ascii_digit));
-                let decimal = digits.and_then(|d| std::str::from_utf8(d).ok()?.parse::<u8>().ok());
-                if let Some(byte) = decimal {
-                    current.push(byte);
-                    i += 4;
-                } else {
-                    if let Some(&c) = bytes.get(i + 1) {
-                        current.push(c);
-                    }
-                    i += 2;
-                }
-            }
-            b'.' => {
-                labels.push(String::from_utf8_lossy(&current).into_owned());
-                current.clear();
-                i += 1;
-            }
-            c => {
-                current.push(c);
-                i += 1;
-            }
-        }
-    }
-    labels.push(String::from_utf8_lossy(&current).into_owned());
-    DnsName::from_labels(labels)
 }
 
 /// Splits TXT rdata into its length-prefixed strings, the same way the wire
@@ -927,13 +872,6 @@ mod tests {
     }
 
     #[test]
-    fn instance_names_keep_dots_in_the_instance_label() {
-        let n = instance_name("Mr. Printer", "_ipp._tcp.", "local.");
-        assert_eq!(n.labels(), ["Mr. Printer", "_ipp", "_tcp", "local"]);
-        assert!(n.is_service_instance());
-    }
-
-    #[test]
     fn service_type_from_meta_browse_result() {
         let (t, domain) = service_type("_ipp", "_tcp.local.").unwrap();
         assert_eq!(t.to_string(), "_ipp._tcp.local");
@@ -941,14 +879,6 @@ mod tests {
         assert_eq!(domain.to_string(), "local");
         assert!(service_type("ipp", "_tcp.local.").is_none());
         assert!(service_type("_ipp", "_xyz.local.").is_none());
-    }
-
-    #[test]
-    fn presentation_names_are_unescaped() {
-        let n = parse_presentation("Martins\\032MacBook\\.Pro.local.");
-        assert_eq!(n.labels(), ["Martins MacBook.Pro", "local"]);
-        assert_eq!(parse_presentation("M\\195\\188ller.local.").first_label(), "Müller");
-        assert_eq!(parse_presentation("BRN30055C1A4C01.local.").to_string(), "BRN30055C1A4C01.local");
     }
 
     #[test]

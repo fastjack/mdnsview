@@ -1,9 +1,10 @@
 //! The wire backend task: receives and decodes mDNS traffic, sends the
 //! scheduler's queries and follows interface changes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::pending;
 use std::io;
+use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::mpsc;
@@ -19,6 +20,9 @@ use crate::model::record::{
 };
 
 const INTERFACE_POLL: Duration = Duration::from_secs(5);
+/// How long the wire source may hear no other host, after its first query,
+/// before it reports itself silent.
+const SILENCE: Duration = Duration::from_secs(15);
 const QUESTIONS_PER_PACKET: usize = 20;
 const KNOWN_ANSWERS_PER_PACKET: usize = 30;
 
@@ -29,6 +33,11 @@ pub struct WireBackend {
     scheduler: Scheduler,
     /// Joined interfaces by index.
     joined: BTreeMap<u32, Interface>,
+    /// Addresses of every interface on the host, to tell our own packets
+    /// from other hosts'.
+    own: HashSet<IpAddr>,
+    first_send: Option<Instant>,
+    last_foreign: Option<Instant>,
 }
 
 impl WireBackend {
@@ -54,6 +63,9 @@ impl WireBackend {
             selector,
             scheduler: Scheduler::new(Instant::now(), device_timeout),
             joined: BTreeMap::new(),
+            own: HashSet::new(),
+            first_send: None,
+            last_foreign: None,
         })
     }
 
@@ -71,6 +83,10 @@ impl WireBackend {
                 return false;
             }
         };
+        self.own = all
+            .iter()
+            .flat_map(|i| i.v4.iter().map(|&a| IpAddr::V4(a)).chain(i.v6.iter().map(|&a| IpAddr::V6(a))))
+            .collect();
         let wanted: BTreeMap<u32, Interface> = self
             .selector
             .select(&all)
@@ -146,6 +162,9 @@ impl WireBackend {
         let Some(iface) = self.joined.get(&rx.ifindex) else {
             return Vec::new(); // not one of our interfaces
         };
+        if !self.own.contains(&rx.src) {
+            self.last_foreign = Some(Instant::now());
+        }
         let iface_name = iface.name.clone();
         let decoded = match codec::decode(bytes) {
             Ok(d) => d,
@@ -206,6 +225,7 @@ impl WireBackend {
         let mut buf6 = vec![0u8; 9000];
         let mut queries_open = true;
         let mut blocked = false;
+        let mut silent = false;
 
         loop {
             let due = self.scheduler.next_due();
@@ -214,6 +234,19 @@ impl WireBackend {
                     if self.sync_interfaces() {
                         self.scheduler.restart_enumeration(Instant::now());
                         if !send(Observation::Interfaces(self.interface_names())).await {
+                            return;
+                        }
+                    }
+                    // Windows Firewall may drop all incoming mDNS to us.
+                    let now_silent = silence(self.first_send, self.last_foreign, Instant::now());
+                    if cfg!(windows) && now_silent != silent {
+                        silent = now_silent;
+                        if silent {
+                            warn!("no mDNS from other hosts for {}s: incoming traffic may be blocked", SILENCE.as_secs());
+                        } else {
+                            info!("mDNS from other hosts arrives again");
+                        }
+                        if !send(Observation::WireSilent(silent)).await {
                             return;
                         }
                     }
@@ -244,6 +277,9 @@ impl WireBackend {
                     let now = Instant::now();
                     let questions = self.scheduler.take_due(now);
                     let results = self.send_questions(&questions, now);
+                    if self.first_send.is_none() && results.iter().any(Result::is_ok) {
+                        self.first_send = Some(now);
+                    }
                     if cfg!(target_os = "macos")
                         && let Some(now_blocked) = local_network_blocked(&results)
                         && now_blocked != blocked
@@ -270,6 +306,16 @@ impl WireBackend {
             }
         }
     }
+}
+
+/// Whether the wire source counts as silent: queries have gone out for at
+/// least [`SILENCE`], and no other host was heard in that time.
+fn silence(first_send: Option<Instant>, last_foreign: Option<Instant>, now: Instant) -> bool {
+    let Some(first_send) = first_send else {
+        return false;
+    };
+    let since = last_foreign.map_or(first_send, |f| f.max(first_send));
+    now.duration_since(since) >= SILENCE
 }
 
 /// Whether a round of sends shows that macOS's Local Network privacy setting
@@ -307,6 +353,23 @@ async fn sleep_or_pending(due: Option<Instant>) {
 mod tests {
     use super::*;
     use crate::config::InterfaceConfig;
+
+    #[test]
+    fn silence_after_fifteen_seconds_without_other_hosts() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        // Nothing sent yet: never silent.
+        assert!(!silence(None, None, at(60)));
+        // Before 15 s, and after 15 s without traffic from other hosts.
+        assert!(!silence(Some(t0), None, at(14)));
+        assert!(silence(Some(t0), None, at(15)));
+        // Traffic at 10 s: silent only 15 s after that.
+        assert!(!silence(Some(t0), Some(at(10)), at(20)));
+        assert!(silence(Some(t0), Some(at(10)), at(25)));
+        // Traffic heard before the first send counts from the send.
+        assert!(!silence(Some(at(5)), Some(at(1)), at(19)));
+        assert!(silence(Some(at(5)), Some(at(1)), at(20)));
+    }
 
     #[test]
     fn local_network_blocked_only_when_every_send_is_unreachable() {

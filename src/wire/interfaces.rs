@@ -107,6 +107,30 @@ mod tests {
     }
 
     #[test]
+    fn default_selection_on_windows() {
+        let mut lo = iface("Loopback Pseudo-Interface 1", 1);
+        lo.loopback = true;
+        let mut bt = iface("Bluetooth Network Connection", 12);
+        bt.up = false;
+        let all = vec![lo, bt, iface("WLAN", 14)];
+        let selected = Selector::new(&InterfaceConfig::default()).unwrap().select(&all);
+        let names: Vec<_> = selected.into_iter().map(|i| i.name).collect();
+        assert_eq!(names, vec!["WLAN"]);
+    }
+
+    #[test]
+    fn windows_names_in_patterns() {
+        let all = vec![iface("WLAN", 14), iface("vEthernet (WSL)", 32)];
+        let config = InterfaceConfig {
+            include: vec![],
+            exclude: vec!["vEthernet (*".into()],
+        };
+        let selected = Selector::new(&config).unwrap().select(&all);
+        let names: Vec<_> = selected.into_iter().map(|i| i.name).collect();
+        assert_eq!(names, vec!["WLAN"]);
+    }
+
+    #[test]
     fn include_list() {
         let config = InterfaceConfig {
             include: vec!["wlan0".into()],

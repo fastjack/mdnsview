@@ -332,6 +332,9 @@ pub enum Observation {
     SourceStatus { source: Source, state: SourceState },
     /// Names of the interfaces the wire backend currently uses.
     Interfaces(Vec<String>),
+    /// Whether the wire source hears nothing from other hosts although its
+    /// queries go out (Windows only; see the wire backend).
+    WireSilent(bool),
 }
 
 /// A request from the store for the wire backend to query a name.

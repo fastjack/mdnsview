@@ -450,6 +450,65 @@ async fn status_bar_sources() {
     assert!(screen(&app(&store)).contains("avahi + wire │"));
 }
 
+fn system(owner: &str, data: RData) -> Observation {
+    Observation::Record(ObservedRecord {
+        name: DnsName::parse(owner),
+        data,
+        ttl: None,
+        cache_flush: false,
+        source: Source::System,
+        src_addr: None,
+        iface: None,
+        at: Instant::now(),
+        wall: SystemTime::now(),
+    })
+}
+
+fn firewall_screen(store: &Store) -> String {
+    let terminal = {
+        let app = app(store);
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|f| { view::render(f, &app, "Windows DNS"); }).unwrap();
+        terminal
+    };
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("
+")
+}
+
+#[tokio::test(start_paused = true)]
+async fn firewall_hint() {
+    let mut store = lan();
+    store.ingest(Observation::WireSilent(true));
+    // Silent, but the daemon has found no service instance: no hint.
+    let s = firewall_screen(&store);
+    assert!(s.contains("Windows DNS + wire │"), "{s}");
+    assert!(!s.contains("Firewall"), "{s}");
+
+    store.ingest(system("_ipp._tcp.local", RData::Ptr(DnsName::parse("Office Printer._ipp._tcp.local"))));
+    let s = firewall_screen(&store);
+    assert!(s.contains("Windows DNS + wire (no replies: check Windows Firewall) │"), "{s}");
+
+    // Only while the daemon itself is active.
+    store.ingest(Observation::SourceStatus {
+        source: Source::System,
+        state: SourceState::Unavailable("stopped".into()),
+    });
+    assert!(!firewall_screen(&store).contains("Firewall"));
+    store.ingest(Observation::SourceStatus {
+        source: Source::System,
+        state: SourceState::Active,
+    });
+
+    store.ingest(Observation::WireSilent(false));
+    let s = firewall_screen(&store);
+    assert!(s.contains("Windows DNS + wire │"), "{s}");
+    assert!(!s.contains("Firewall"), "{s}");
+}
+
 /// 40 host-only devices `host00.local` .. `host39.local`.
 fn many_hosts() -> Store {
     let mut store = Store::new(TIMEOUT);
