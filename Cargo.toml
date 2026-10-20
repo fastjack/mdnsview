@@ -24,6 +24,8 @@ toml = "1.1.8"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "6.0.0", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]

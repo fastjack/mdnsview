@@ -311,6 +311,11 @@ impl ObservedRecord {
     }
 }
 
+/// Reason the wire source reports when macOS's Local Network privacy
+/// setting blocks its multicast traffic.
+pub const LOCAL_NETWORK_BLOCKED: &str = "blocked by macOS Local Network permission: allow the app \
+     that starts mdnsview in System Settings › Privacy & Security › Local Network";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceState {
     Starting,

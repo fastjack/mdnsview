@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use tokio::time::Instant;
 
-use super::record::{DnsName, RData, RecordKey, SourceState, Sources, rtype};
+use super::record::{DnsName, LOCAL_NETWORK_BLOCKED, RData, RecordKey, SourceState, Sources, rtype};
 use super::service_names;
 use super::store::StoredRecord;
 
@@ -43,7 +43,7 @@ impl Status {
     pub fn sources_label(&self, system_name: &str) -> String {
         let system = self.system == SourceState::Active;
         let wire = self.wire == SourceState::Active;
-        match (system, wire) {
+        let label = match (system, wire) {
             (true, true) => format!("{system_name} + wire"),
             (false, true) => "wire only".to_string(),
             (true, false) => "system only".to_string(),
@@ -51,6 +51,11 @@ impl Status {
                 (SourceState::Starting, _) | (_, SourceState::Starting) => "starting".to_string(),
                 _ => "no sources".to_string(),
             },
+        };
+        if self.wire == SourceState::Unavailable(LOCAL_NETWORK_BLOCKED.into()) {
+            format!("{label} (Local Network access blocked)")
+        } else {
+            label
         }
     }
 

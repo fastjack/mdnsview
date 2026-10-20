@@ -68,26 +68,43 @@ device with its own port, addresses and TXT data. The service details show a
 
 `mdnsview` combines two sources:
 
-- **The OS mDNS daemon** (avahi on Linux, over D-Bus) for a quick first
-  overview.
+- **The OS mDNS daemon** for a quick first overview: avahi on Linux (over
+  D-Bus), mDNSResponder on macOS (through the system `dns_sd` API).
 - **Its own multicast socket** on UDP port 5353, IPv4 and IPv6. It listens to
   all mDNS traffic and sends its own queries to fill in details and to check
   that known hosts are still there.
 
-No root privileges are needed. The socket shares port 5353 with avahi
-(`SO_REUSEADDR` / `SO_REUSEPORT`), so both keep working. If avahi is not
-running, the status bar shows `wire only`; if the port cannot be shared, it
+No root privileges are needed. The socket shares port 5353 with the daemon
+(`SO_REUSEADDR` / `SO_REUSEPORT`), so both keep working. With both sources
+active, the status bar shows `avahi + wire` or `mDNSResponder + wire`. If the
+daemon is not running, it shows `wire only`; if the port cannot be shared, it
 shows `system only`. If neither works, `mdnsview` exits with an error naming
 both problems.
 
-Logs are written to `~/.local/state/mdnsview/mdnsview.log`; set
+Logs are written to `~/.local/state/mdnsview/mdnsview.log` on Linux and
+`~/Library/Caches/mdnsview/mdnsview.log` on macOS; set
 `RUST_LOG=mdnsview=debug` for more detail.
+
+### macOS
+
+`mdnsview` runs on macOS as well as on Linux. On macOS:
+
+- When `mdnsview` is started from a terminal, macOS does not apply its
+  **Local Network** privacy setting to it, so nothing needs to be allowed.
+  If it is ever started in a way where the setting does apply and access is
+  denied, the status bar shows `(Local Network access blocked)` and only
+  mDNSResponder results appear; allow access in **System Settings › Privacy
+  & Security › Local Network**.
+- AWDL, tunnel and similar links (`awdl*`, `llw*`, `utun*`, `anpi*`) are
+  skipped by default.
+- The configuration file is
+  `~/Library/Application Support/mdnsview/config.toml`.
 
 ## Configuration
 
-`mdnsview` reads `config.toml` from the platform configuration directory
-(`$XDG_CONFIG_HOME/mdnsview/config.toml`, usually `~/.config/mdnsview/config.toml`
-on Linux). Use `--config <path>` to read a different file. Without a file, the
+`mdnsview` reads `config.toml` from the platform configuration directory:
+`$XDG_CONFIG_HOME/mdnsview/config.toml` (usually `~/.config/mdnsview/config.toml`)
+on Linux, and `~/Library/Application Support/mdnsview/config.toml` on macOS. Use `--config <path>` to read a different file. Without a file, the
 defaults below apply. Every setting is optional; unknown keys and invalid values
 are reported and the program exits before starting.
 
@@ -107,6 +124,8 @@ mouse = true
 # Glob patterns of interfaces to use. Empty = every interface that is up,
 # multicast-capable and not loopback.
 include = []
-# Glob patterns of interfaces to skip. Setting this replaces the default list.
-exclude = ["veth*"]
+# Glob patterns of interfaces to skip. Setting this replaces the default list,
+# which skips container veth pairs and macOS links that carry no LAN mDNS
+# (AWDL, tunnels).
+exclude = ["veth*", "awdl*", "llw*", "utun*", "anpi*"]
 ```

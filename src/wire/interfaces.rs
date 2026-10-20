@@ -93,6 +93,20 @@ mod tests {
     }
 
     #[test]
+    fn default_selection_on_macos() {
+        let mut lo0 = iface("lo0", 1);
+        lo0.loopback = true;
+        let mac = ["en0", "awdl0", "llw0", "utun3", "anpi0"]
+            .into_iter()
+            .zip(2..)
+            .map(|(name, index)| iface(name, index));
+        let all: Vec<Interface> = std::iter::once(lo0).chain(mac).collect();
+        let selected = Selector::new(&InterfaceConfig::default()).unwrap().select(&all);
+        let names: Vec<_> = selected.into_iter().map(|i| i.name).collect();
+        assert_eq!(names, vec!["en0"]);
+    }
+
+    #[test]
     fn include_list() {
         let config = InterfaceConfig {
             include: vec!["wlan0".into()],

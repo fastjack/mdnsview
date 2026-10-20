@@ -9,6 +9,8 @@ use crate::model::record::Observation;
 
 #[cfg(target_os = "linux")]
 pub mod avahi;
+#[cfg(target_os = "macos")]
+pub mod dnssd;
 pub mod null;
 
 pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -30,7 +32,11 @@ pub fn platform() -> Box<dyn SystemBackend> {
     {
         Box::new(avahi::AvahiBackend)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(dnssd::DnsSdBackend)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Box::new(null::NullBackend)
     }

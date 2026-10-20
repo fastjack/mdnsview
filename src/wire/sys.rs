@@ -1,4 +1,4 @@
-//! Platform-specific socket and interface code (Unix / Linux).
+//! Platform-specific socket and interface code (Unix: Linux and macOS).
 //!
 //! Everything that differs between operating systems lives here, so a
 //! Windows implementation can replace this module later.
@@ -68,6 +68,8 @@ impl MdnsSocket {
         socket.set_multicast_ttl_v4(255)?;
         socket.set_multicast_loop_v4(true)?;
         // Only deliver groups joined by this socket, not by others on the host.
+        // BSD-derived stacks such as macOS already behave this way.
+        #[cfg(target_os = "linux")]
         socket.set_multicast_all_v4(false)?;
         setsockopt(&socket, sockopt::Ipv4PacketInfo, &true).map_err(io::Error::from)?;
         socket.bind(&SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())?;
@@ -103,7 +105,7 @@ impl MdnsSocket {
         } else {
             self.fd
                 .get_ref()
-                .join_multicast_v4_n(&GROUP_V4, &InterfaceIndexOrAddress::Index(iface.index))
+                .join_multicast_v4_n(&GROUP_V4, &v4_membership(iface)?)
         }
     }
 
@@ -113,7 +115,7 @@ impl MdnsSocket {
         } else {
             self.fd
                 .get_ref()
-                .leave_multicast_v4_n(&GROUP_V4, &InterfaceIndexOrAddress::Index(iface.index))
+                .leave_multicast_v4_n(&GROUP_V4, &v4_membership(iface)?)
         }
     }
 
@@ -144,11 +146,28 @@ impl MdnsSocket {
     }
 }
 
+/// How to name the interface in an IPv4 membership request.
+///
+/// Linux accepts the interface index (`ip_mreqn`). macOS does not reliably
+/// honour it, so the interface's first IPv4 address is used there instead.
+fn v4_membership(iface: &Interface) -> io::Result<InterfaceIndexOrAddress> {
+    if cfg!(target_os = "macos") {
+        let addr = iface.v4.first().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::AddrNotAvailable, "interface has no IPv4 address")
+        })?;
+        Ok(InterfaceIndexOrAddress::Address(*addr))
+    } else {
+        Ok(InterfaceIndexOrAddress::Index(iface.index))
+    }
+}
+
 fn share_port(socket: &Socket) -> io::Result<()> {
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)
 }
 
+// `ipi_ifindex` is a `c_int` on Linux and a `c_uint` on macOS.
+#[allow(clippy::unnecessary_cast)]
 fn recv_with_ifindex(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<Received> {
     let mut cmsg = nix::cmsg_space!(libc::in6_pktinfo);
     let mut iov = [IoSliceMut::new(buf)];
@@ -175,4 +194,54 @@ fn recv_with_ifindex(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<Recei
         src,
         ifindex,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::model::record::{DnsName, rtype};
+    use crate::wire::codec;
+
+    /// Checks on the real network that group traffic arrives with the index of
+    /// the interface it was joined on:
+    /// `cargo test live_wire_ifindex -- --ignored --nocapture`.
+    /// Set MDNSVIEW_LIVE_IFACE to pick the interface (default en0 on macOS, eth0 elsewhere).
+    #[tokio::test]
+    #[ignore = "uses the real network"]
+    async fn live_wire_ifindex() {
+        let default = if cfg!(target_os = "macos") { "en0" } else { "eth0" };
+        let name = std::env::var("MDNSVIEW_LIVE_IFACE").unwrap_or_else(|_| default.into());
+        let iface = list_interfaces()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| panic!("no interface {name}"));
+        let query = codec::encode_query(
+            &[(DnsName::parse("_services._dns-sd._udp.local"), rtype::PTR)],
+            &[],
+        )
+        .unwrap();
+        let mut buf = vec![0u8; 9000];
+        for socket in [MdnsSocket::open_v4().unwrap(), MdnsSocket::open_v6().unwrap()] {
+            let label = if socket.is_v6() { "IPv6" } else { "IPv4" };
+            socket.join(&iface).unwrap();
+            socket.send_to_group(&query, &iface).unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let mut from_others = 0;
+            while let Ok(rx) = tokio::time::timeout_at(deadline, socket.recv(&mut buf)).await {
+                let rx = rx.unwrap();
+                println!("{label}: {} bytes from {} on ifindex {}", rx.len, rx.src, rx.ifindex);
+                assert_eq!(rx.ifindex, iface.index, "{label}: wrong interface index");
+                let own = match rx.src {
+                    IpAddr::V4(a) => iface.v4.contains(&a),
+                    IpAddr::V6(a) => iface.v6.contains(&a),
+                };
+                from_others += usize::from(!own);
+            }
+            assert!(from_others > 0, "{label}: nothing received from other hosts on {name}");
+            socket.leave(&iface).unwrap();
+        }
+    }
 }

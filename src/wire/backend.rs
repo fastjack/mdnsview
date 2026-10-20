@@ -14,7 +14,9 @@ use super::codec::{self, WireRecord};
 use super::interfaces::{Interface, Selector};
 use super::scheduler::{Question, Scheduler};
 use super::sys::{self, MdnsSocket, Received};
-use crate::model::record::{Observation, ObservedRecord, QueryRequest, Source, SourceState};
+use crate::model::record::{
+    LOCAL_NETWORK_BLOCKED, Observation, ObservedRecord, QueryRequest, Source, SourceState,
+};
 
 const INTERFACE_POLL: Duration = Duration::from_secs(5);
 const QUESTIONS_PER_PACKET: usize = 20;
@@ -107,7 +109,10 @@ impl WireBackend {
         self.joined.values().map(|i| i.name.clone()).collect()
     }
 
-    fn send_questions(&self, questions: &[Question], now: Instant) {
+    /// Sends the questions on every joined interface and returns the result
+    /// of each send attempt.
+    fn send_questions(&self, questions: &[Question], now: Instant) -> Vec<io::Result<()>> {
+        let mut results = Vec::new();
         for chunk in questions.chunks(QUESTIONS_PER_PACKET) {
             let mut known = self.scheduler.known_answers(chunk, now);
             known.truncate(KNOWN_ANSWERS_PER_PACKET);
@@ -124,13 +129,16 @@ impl WireBackend {
                     if !has_address {
                         continue;
                     }
-                    if let Err(e) = s.send_to_group(&bytes, iface) {
+                    let result = s.send_to_group(&bytes, iface);
+                    if let Err(e) = &result {
                         debug!("send on {} ({}) failed: {e}", iface.name, ipv(s));
                     }
+                    results.push(result);
                 }
             }
             debug!("sent {} questions, {} known answers", chunk.len(), known.len());
         }
+        results
     }
 
     /// Turns a received datagram into observations.
@@ -197,6 +205,7 @@ impl WireBackend {
         let mut buf4 = vec![0u8; 9000];
         let mut buf6 = vec![0u8; 9000];
         let mut queries_open = true;
+        let mut blocked = false;
 
         loop {
             let due = self.scheduler.next_due();
@@ -234,7 +243,23 @@ impl WireBackend {
                 _ = sleep_or_pending(due) => {
                     let now = Instant::now();
                     let questions = self.scheduler.take_due(now);
-                    self.send_questions(&questions, now);
+                    let results = self.send_questions(&questions, now);
+                    if cfg!(target_os = "macos")
+                        && let Some(now_blocked) = local_network_blocked(&results)
+                        && now_blocked != blocked
+                    {
+                        blocked = now_blocked;
+                        let state = if blocked {
+                            warn!("multicast sends fail: {LOCAL_NETWORK_BLOCKED}");
+                            SourceState::Unavailable(LOCAL_NETWORK_BLOCKED.into())
+                        } else {
+                            info!("multicast sends work again");
+                            SourceState::Active
+                        };
+                        if !send(Observation::SourceStatus { source: Source::Wire, state }).await {
+                            return;
+                        }
+                    }
                     continue;
                 }
             };
@@ -245,6 +270,19 @@ impl WireBackend {
             }
         }
     }
+}
+
+/// Whether a round of sends shows that macOS's Local Network privacy setting
+/// blocks us: every attempt failed with "no route to host". `None` when
+/// nothing was sent.
+fn local_network_blocked(results: &[io::Result<()>]) -> Option<bool> {
+    if results.is_empty() {
+        return None;
+    }
+    Some(results.iter().all(|r| {
+        r.as_ref()
+            .is_err_and(|e| e.raw_os_error() == Some(libc::EHOSTUNREACH))
+    }))
 }
 
 fn ipv(s: &MdnsSocket) -> &'static str {
@@ -269,6 +307,17 @@ async fn sleep_or_pending(due: Option<Instant>) {
 mod tests {
     use super::*;
     use crate::config::InterfaceConfig;
+
+    #[test]
+    fn local_network_blocked_only_when_every_send_is_unreachable() {
+        let unreachable = || Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH));
+        let other = || Err(io::Error::from_raw_os_error(libc::ENETDOWN));
+        assert_eq!(local_network_blocked(&[unreachable(), unreachable()]), Some(true));
+        assert_eq!(local_network_blocked(&[unreachable(), Ok(())]), Some(false));
+        assert_eq!(local_network_blocked(&[unreachable(), other()]), Some(false));
+        assert_eq!(local_network_blocked(&[Ok(()), Ok(())]), Some(false));
+        assert_eq!(local_network_blocked(&[]), None);
+    }
 
     /// Runs against the real network: `cargo test live_wire -- --ignored --nocapture`.
     /// Set MDNSVIEW_LIVE_SECS to change the duration (default 6).

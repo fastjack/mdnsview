@@ -44,7 +44,11 @@ impl Default for InterfaceConfig {
     fn default() -> Self {
         Self {
             include: Vec::new(),
-            exclude: vec!["veth*".to_string()],
+            // Container veth pairs, and macOS links that never carry LAN
+            // mDNS: AWDL (awdl, llw), tunnels (utun) and anpi.
+            exclude: ["veth*", "awdl*", "llw*", "utun*", "anpi*"]
+                .map(String::from)
+                .to_vec(),
         }
     }
 }
@@ -123,7 +127,10 @@ mod tests {
         assert_eq!(c, Config::default());
         assert_eq!(c.device_timeout, Duration::from_secs(300));
         assert!(c.interfaces.include.is_empty());
-        assert_eq!(c.interfaces.exclude, vec!["veth*"]);
+        assert_eq!(
+            c.interfaces.exclude,
+            vec!["veth*", "awdl*", "llw*", "utun*", "anpi*"]
+        );
         assert!(c.ipv6);
         assert!(c.mouse);
     }
@@ -195,5 +202,6 @@ mod tests {
         let c = parse(&readme[start..end]).unwrap();
         assert_eq!(c.device_timeout, Duration::from_secs(300));
         assert!(c.mouse);
+        assert_eq!(c.interfaces.exclude, InterfaceConfig::default().exclude);
     }
 }

@@ -13,7 +13,9 @@ use tokio::time::{Instant, advance};
 
 use super::app::{App, DetailMode, Focus, HitMap, Mode};
 use super::view;
-use crate::model::record::{DnsName, Observation, ObservedRecord, RData, Source, SourceState};
+use crate::model::record::{
+    DnsName, LOCAL_NETWORK_BLOCKED, Observation, ObservedRecord, RData, Source, SourceState,
+};
 use crate::model::store::Store;
 
 const TIMEOUT: Duration = Duration::from_secs(300);
@@ -432,7 +434,20 @@ async fn status_bar_sources() {
         source: Source::Wire,
         state: SourceState::Unavailable("bind".into()),
     });
-    assert!(screen(&app(&store)).contains("system only"));
+    assert!(screen(&app(&store)).contains("system only │"));
+
+    store.ingest(Observation::SourceStatus {
+        source: Source::Wire,
+        state: SourceState::Unavailable(LOCAL_NETWORK_BLOCKED.into()),
+    });
+    let s = screen(&app(&store));
+    assert!(s.contains("system only (Local Network access blocked) │"), "{s}");
+
+    store.ingest(Observation::SourceStatus {
+        source: Source::Wire,
+        state: SourceState::Active,
+    });
+    assert!(screen(&app(&store)).contains("avahi + wire │"));
 }
 
 /// 40 host-only devices `host00.local` .. `host39.local`.
