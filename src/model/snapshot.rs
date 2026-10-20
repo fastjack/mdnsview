@@ -96,9 +96,13 @@ pub struct Service {
     pub last_seen: Instant,
     pub retained: bool,
     pub gone: bool,
+    /// Other hosts announcing the same instance name, sorted.
+    pub shared_with: Vec<DnsName>,
     /// The service's own records plus its host's records.
     pub records: Vec<RecordView>,
     pub(crate) own_keys: Vec<RecordKey>,
+    /// The own records that decide liveness and last-seen.
+    pub(crate) life_keys: Vec<RecordKey>,
 }
 
 /// One host name of a device, for per-host garbage collection.
@@ -254,6 +258,95 @@ impl DeriveInput<'_> {
     }
 }
 
+type Entry<'a> = (&'a RecordKey, &'a StoredRecord);
+
+/// The records of one service: an instance name as announced by one host.
+struct InstancePart<'a> {
+    id: String,
+    own: Vec<Entry<'a>>,
+    /// Records that decide liveness and last-seen. Records shared with
+    /// other hosts' parts are left out, so they cannot keep a silent host alive.
+    life: Vec<Entry<'a>>,
+    shared_with: Vec<DnsName>,
+}
+
+/// Splits an instance into one part per SRV target. With fewer than two
+/// targets, the whole instance is one part with the plain instance id.
+fn split_by_host<'a>(
+    input: &DeriveInput<'a>,
+    id: &str,
+    ptrs: Vec<Entry<'a>>,
+    owned: Vec<Entry<'a>>,
+) -> Vec<InstancePart<'a>> {
+    let mut by_target: BTreeMap<String, (DnsName, Vec<Entry<'a>>)> = BTreeMap::new();
+    for e in &owned {
+        if let RData::Srv { target, .. } = &e.1.data {
+            by_target
+                .entry(target.key().to_string())
+                .or_insert_with(|| (target.clone(), Vec::new()))
+                .1
+                .push(*e);
+        }
+    }
+    if by_target.len() < 2 {
+        let mut own = ptrs;
+        own.extend(owned);
+        return vec![InstancePart {
+            id: id.to_string(),
+            life: own.clone(),
+            own,
+            shared_with: Vec::new(),
+        }];
+    }
+    // The earliest announcer keeps the plain instance id.
+    let mut targets: Vec<(String, (DnsName, Vec<Entry<'a>>))> = by_target.into_iter().collect();
+    targets.sort_by_key(|(key, (_, srvs))| (srvs.iter().map(|(_, r)| r.first_seen).min(), key.clone()));
+
+    let addresses: Vec<BTreeSet<IpAddr>> = targets
+        .iter()
+        .map(|(_, (host, _))| input.owned(host).filter_map(|(_, r)| r.data.address()).collect())
+        .collect();
+    let mut txts: Vec<Vec<Entry<'a>>> = vec![Vec::new(); targets.len()];
+    let mut unassigned: Vec<Entry<'a>> = Vec::new();
+    let mut shared = ptrs;
+    for e in owned {
+        match &e.1.data {
+            RData::Srv { .. } => {}
+            RData::Txt(_) => {
+                match e.1.src_addr.and_then(|a| addresses.iter().position(|set| set.contains(&a))) {
+                    Some(i) => txts[i].push(e),
+                    None => unassigned.push(e),
+                }
+            }
+            _ => shared.push(e),
+        }
+    }
+    let hosts: Vec<DnsName> = targets.iter().map(|(_, (host, _))| host.clone()).collect();
+    targets
+        .into_iter()
+        .zip(txts)
+        .enumerate()
+        .map(|(i, ((key, (_, srvs)), txt))| {
+            let mut own = shared.clone();
+            if txt.is_empty() {
+                own.extend(unassigned.iter().copied());
+            }
+            let mut life = srvs;
+            life.extend(txt);
+            own.extend(life.iter().copied());
+            let mut shared_with: Vec<DnsName> =
+                hosts.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, h)| h.clone()).collect();
+            shared_with.sort();
+            InstancePart {
+                id: if i == 0 { id.to_string() } else { format!("{id}\u{0}{key}") },
+                own,
+                life,
+                shared_with,
+            }
+        })
+        .collect()
+}
+
 struct DeviceBuilder {
     host: Option<DnsName>,
     services: Vec<String>,
@@ -358,78 +451,85 @@ pub(crate) fn derive(input: &DeriveInput<'_>) -> Snapshot {
     let mut devices: BTreeMap<String, DeviceBuilder> = BTreeMap::new();
     let mut services: HashMap<String, Service> = HashMap::new();
 
-    for (id, instance) in &instances {
+    for (key, instance) in &instances {
         let type_name = instance.parent();
-        let mut own: Vec<(&RecordKey, &StoredRecord)> = input
+        let ptrs: Vec<Entry> = input
             .owned(&type_name)
             .filter(|(_, r)| matches!(&r.data, RData::Ptr(t) if t == instance))
             .collect();
-        own.extend(input.owned(instance));
-        let own_records: Vec<&StoredRecord> = own.iter().map(|(_, r)| *r).collect();
+        for InstancePart { id, own, life, shared_with } in
+            split_by_host(input, key, ptrs, input.owned(instance).collect())
+        {
+            let id = &id;
+            let own_records: Vec<&StoredRecord> = own.iter().map(|(_, r)| *r).collect();
+            let life_records: Vec<&StoredRecord> = life.iter().map(|(_, r)| *r).collect();
 
-        let srv = input.best(&own_records, rtype::SRV);
-        let (host, port) = match srv.map(|r| &r.data) {
-            Some(RData::Srv { target, port, .. }) => (Some(target.clone()), Some(*port)),
-            _ => (None, None),
-        };
-        let txt = match input.best(&own_records, rtype::TXT).map(|r| &r.data) {
-            Some(RData::Txt(strings)) => {
-                let mut entries = txt_entries(strings);
-                entries.sort_by_key(|e| e.0.to_lowercase());
-                entries
-            }
-            _ => Vec::new(),
-        };
+            let srv = input.best(&own_records, rtype::SRV);
+            let (host, port) = match srv.map(|r| &r.data) {
+                Some(RData::Srv { target, port, .. }) => (Some(target.clone()), Some(*port)),
+                _ => (None, None),
+            };
+            let txt = match input.best(&own_records, rtype::TXT).map(|r| &r.data) {
+                Some(RData::Txt(strings)) => {
+                    let mut entries = txt_entries(strings);
+                    entries.sort_by_key(|e| e.0.to_lowercase());
+                    entries
+                }
+                _ => Vec::new(),
+            };
 
-        let host_records: Vec<&StoredRecord> = host
-            .as_ref()
-            .map(|h| input.owned(h).map(|(_, r)| r).collect())
-            .unwrap_or_default();
-        let addresses = addresses_of(&host_records);
+            let host_records: Vec<&StoredRecord> = host
+                .as_ref()
+                .map(|h| input.owned(h).map(|(_, r)| r).collect())
+                .unwrap_or_default();
+            let addresses = addresses_of(&host_records);
 
-        let mut records: Vec<RecordView> = own_records.iter().map(|r| input.view(r)).collect();
-        records.sort_by_key(record_order);
-        let mut host_views: Vec<RecordView> = host_records.iter().map(|r| input.view(r)).collect();
-        host_views.sort_by_key(record_order);
-        records.extend(host_views);
+            let mut records: Vec<RecordView> = own_records.iter().map(|r| input.view(r)).collect();
+            records.sort_by_key(record_order);
+            let mut host_views: Vec<RecordView> = host_records.iter().map(|r| input.view(r)).collect();
+            host_views.sort_by_key(record_order);
+            records.extend(host_views);
 
-        let service_type = instance.instance_type().unwrap_or_default();
-        let last_seen = input.last_seen(own_records.iter().copied());
-        let device_id = host
-            .as_ref()
-            .map(|h| h.key().to_string())
-            .unwrap_or_else(|| UNRESOLVED_ID.to_string());
+            let service_type = instance.instance_type().unwrap_or_default();
+            let last_seen = input.last_seen(life_records.iter().copied());
+            let device_id = host
+                .as_ref()
+                .map(|h| h.key().to_string())
+                .unwrap_or_else(|| UNRESOLVED_ID.to_string());
 
-        devices
-            .entry(device_id.clone())
-            .or_insert_with(|| DeviceBuilder {
-                host: host.clone(),
-                services: Vec::new(),
-            })
-            .services
-            .push(id.clone());
+            devices
+                .entry(device_id.clone())
+                .or_insert_with(|| DeviceBuilder {
+                    host: host.clone(),
+                    services: Vec::new(),
+                })
+                .services
+                .push(id.clone());
 
-        services.insert(
-            id.clone(),
-            Service {
-                id: id.clone(),
-                instance: instance.clone(),
-                name: instance.first_label().to_string(),
-                type_label: service_names::label(&service_type),
-                service_type,
-                host,
-                device_id,
-                port,
-                txt,
-                addresses,
-                state: input.liveness(own_records.iter().copied()),
-                last_seen,
-                retained: input.retained.contains(id),
-                gone: input.is_gone(last_seen),
-                records,
-                own_keys: own.iter().map(|(k, _)| (*k).clone()).collect(),
-            },
-        );
+            services.insert(
+                id.clone(),
+                Service {
+                    id: id.clone(),
+                    instance: instance.clone(),
+                    name: instance.first_label().to_string(),
+                    type_label: service_names::label(&service_type),
+                    service_type,
+                    host,
+                    device_id,
+                    port,
+                    txt,
+                    addresses,
+                    state: input.liveness(life_records.iter().copied()),
+                    last_seen,
+                    retained: input.retained.contains(id),
+                    gone: input.is_gone(last_seen),
+                    shared_with,
+                    records,
+                    own_keys: own.iter().map(|(k, _)| (*k).clone()).collect(),
+                    life_keys: life.iter().map(|(k, _)| (*k).clone()).collect(),
+                },
+            );
+        }
     }
 
     // Hosts that only have address records.
@@ -457,7 +557,7 @@ pub(crate) fn derive(input: &DeriveInput<'_>) -> Snapshot {
             let records = host_entries.iter().map(|(_, r)| *r).chain(
                 svc_ids
                     .iter()
-                    .flat_map(|s| services[s].own_keys.iter())
+                    .flat_map(|s| services[s].life_keys.iter())
                     .filter_map(|k| input.records.get(k)),
             );
             let last_seen = input.last_seen(records);
@@ -506,7 +606,7 @@ pub(crate) fn derive(input: &DeriveInput<'_>) -> Snapshot {
         let all_records = host_records.iter().copied().chain(
             svc_ids
                 .iter()
-                .flat_map(|s| services[s].own_keys.iter())
+                .flat_map(|s| services[s].life_keys.iter())
                 .filter_map(|k| input.records.get(k)),
         );
         let state = input.liveness(all_records.clone());

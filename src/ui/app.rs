@@ -86,6 +86,9 @@ pub struct App {
     pub editing_filter: bool,
     pub left: Option<String>,
     pub middle: Option<String>,
+    /// Instance and host key of the selected service, to find it again when
+    /// its id changes because another host announces the same instance name.
+    middle_origin: Option<(String, Option<String>)>,
     pub detail_scroll: u16,
     pub quit: bool,
     /// Whether mouse capture should be on.
@@ -103,6 +106,7 @@ impl App {
             editing_filter: false,
             left: None,
             middle: None,
+            middle_origin: None,
             detail_scroll: 0,
             quit: false,
             mouse: true,
@@ -220,11 +224,25 @@ impl App {
             self.middle = None;
             self.detail_scroll = 0;
         }
-        let middle_ids: Vec<String> = self.middle_items().iter().map(|s| s.id.clone()).collect();
-        if !self.middle.as_ref().is_some_and(|m| middle_ids.contains(m)) {
-            self.middle = middle_ids.first().cloned();
-            self.detail_scroll = 0;
+        let middle: Vec<(String, (String, Option<String>))> =
+            self.middle_items().iter().map(|s| (s.id.clone(), Self::origin(s))).collect();
+        if !self.middle.as_ref().is_some_and(|m| middle.iter().any(|(id, _)| id == m)) {
+            let same = self
+                .middle_origin
+                .as_ref()
+                .filter(|_| self.middle.is_some())
+                .and_then(|origin| middle.iter().find(|(_, o)| o == origin))
+                .map(|(id, _)| id.clone());
+            if same.is_none() {
+                self.detail_scroll = 0;
+            }
+            self.middle = same.or_else(|| middle.first().map(|(id, _)| id.clone()));
         }
+        self.middle_origin = self.selected_service().map(Self::origin);
+    }
+
+    fn origin(s: &Service) -> (String, Option<String>) {
+        (s.instance.key().to_string(), s.host.as_ref().map(|h| h.key().to_string()))
     }
 
     /// Ids the store must keep while they are selected.

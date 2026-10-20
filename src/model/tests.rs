@@ -632,3 +632,239 @@ async fn retained_gone_merged_device_kept_whole_until_released() {
     assert!(snap(&store).devices.is_empty());
     assert_eq!(store.record_count(), 0);
 }
+
+/// Sets the source address and cache-flush bit of a wire record.
+fn sent_from(src: &str, obs: Observation) -> Observation {
+    let Observation::Record(mut r) = obs else {
+        unreachable!()
+    };
+    r.src_addr = Some(src.parse().unwrap());
+    r.cache_flush = !matches!(r.data, RData::Ptr(_));
+    Observation::Record(r)
+}
+
+const TEAMVIEWER: &str = "0._teamviewer._tcp.local";
+const EAOAATI: (&str, &str, &str) = ("DESKTOP-EAOAATI.local", "192.168.4.135", "925584742");
+const SEPKJ: (&str, &str, &str) = ("DESKTOP-28SEPKJ-2.local", "fe80::c96a:fae5:472d:f9c", "1800894754");
+const EAOAATI_TV: &str = "0._teamviewer._tcp.local\u{0}desktop-eaoaati.local";
+
+/// One PC's TeamViewer announcement, as observed on the office LAN.
+fn teamviewer_pc(store: &mut Store, (host, addr, dyngate): (&str, &str, &str)) {
+    let address = match addr.parse::<IpAddr>().unwrap() {
+        IpAddr::V4(a) => RData::A(a),
+        IpAddr::V6(a) => RData::Aaaa(a),
+    };
+    store.ingest(sent_from(addr, wire("_teamviewer._tcp.local", ptr(TEAMVIEWER), 4500)));
+    store.ingest(sent_from(addr, wire(TEAMVIEWER, srv(host, 2020), 120)));
+    store.ingest(sent_from(addr, wire(TEAMVIEWER, txt(&[&format!("DyngateID={dyngate}")]), 4500)));
+    store.ingest(sent_from(addr, wire(host, address, 120)));
+}
+
+/// Two PCs announcing the same instance name; DESKTOP-28SEPKJ-2 was first.
+async fn teamviewer_twins(store: &mut Store) {
+    teamviewer_pc(store, SEPKJ);
+    advance(Duration::from_secs(1)).await;
+    teamviewer_pc(store, EAOAATI);
+}
+
+#[tokio::test(start_paused = true)]
+async fn instance_announced_by_two_hosts_is_split() {
+    let mut store = Store::new(TIMEOUT);
+    teamviewer_twins(&mut store).await;
+    let s = snap(&store);
+    assert_eq!(device_labels(&s), vec!["0", "0"]);
+    let mut hosts: Vec<&str> = s.devices.iter().map(|d| d.id.as_str()).collect();
+    hosts.sort();
+    assert_eq!(hosts, vec!["desktop-28sepkj-2.local", "desktop-eaoaati.local"]);
+    for d in &s.devices {
+        assert_eq!(d.services.len(), 1, "{}", d.id);
+        let svc = &s.services[&d.services[0]];
+        assert_eq!(svc.service_type, "_teamviewer._tcp");
+        assert_eq!(svc.device_id, d.id);
+        assert_eq!(svc.host.as_ref().unwrap().key(), d.id);
+    }
+}
+
+fn dyngate(s: &Snapshot, id: &str) -> String {
+    let svc = &s.services[id];
+    let value = svc.txt.iter().find(|(k, _)| k == "DyngateID").and_then(|(_, v)| v.clone());
+    String::from_utf8(value.unwrap()).unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn txt_of_a_shared_instance_assigned_by_source_address() {
+    let mut store = Store::new(TIMEOUT);
+    teamviewer_twins(&mut store).await;
+    let s = snap(&store);
+    assert_eq!(dyngate(&s, TEAMVIEWER), SEPKJ.2);
+    assert_eq!(dyngate(&s, EAOAATI_TV), EAOAATI.2);
+    assert_eq!(s.services[EAOAATI_TV].addresses, vec![EAOAATI.1.parse::<IpAddr>().unwrap()]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn txt_without_a_known_source_is_shown_on_both_twins() {
+    let mut store = Store::new(TIMEOUT);
+    for (host, addr, _) in [SEPKJ, EAOAATI] {
+        store.ingest(sent_from(addr, wire(TEAMVIEWER, srv(host, 2020), 120)));
+        store.ingest(sent_from(addr, wire(host, RData::A(Ipv4Addr::new(10, 0, 0, 1 + host.len() as u8)), 120)));
+    }
+    store.ingest(sent_from("192.168.9.9", wire(TEAMVIEWER, txt(&["DyngateID=1"]), 4500)));
+    let s = snap(&store);
+    assert_eq!(s.services.len(), 2);
+    for svc in s.services.values() {
+        assert_eq!(dyngate(&s, &svc.id), "1");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_announcer_keeps_the_plain_id() {
+    let mut store = Store::new(TIMEOUT);
+    teamviewer_pc(&mut store, EAOAATI);
+    assert!(snap(&store).services.contains_key(TEAMVIEWER), "a single host keeps the plain id");
+    advance(Duration::from_secs(1)).await;
+    // DESKTOP-28SEPKJ-2 has the smaller key but arrives later.
+    teamviewer_pc(&mut store, SEPKJ);
+    let s = snap(&store);
+    assert_eq!(s.services[TEAMVIEWER].device_id, "desktop-eaoaati.local");
+    assert_eq!(
+        s.services["0._teamviewer._tcp.local\u{0}desktop-28sepkj-2.local"].device_id,
+        "desktop-28sepkj-2.local"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn remaining_twin_takes_the_plain_id() {
+    let mut store = Store::new(TIMEOUT);
+    teamviewer_twins(&mut store).await;
+    // Only DESKTOP-EAOAATI keeps answering.
+    for _ in 0..4 {
+        advance(Duration::from_secs(100)).await;
+        teamviewer_pc(&mut store, EAOAATI);
+    }
+    store.gc(Instant::now());
+    let s = snap(&store);
+    assert_eq!(s.services.len(), 1);
+    assert_eq!(s.services[TEAMVIEWER].device_id, "desktop-eaoaati.local");
+}
+
+#[tokio::test(start_paused = true)]
+async fn twins_list_each_other() {
+    let mut store = Store::new(TIMEOUT);
+    teamviewer_twins(&mut store).await;
+    advertise(&mut store, "Office Printer._ipp._tcp.local", "brother.local", 631, 4500);
+    let s = snap(&store);
+    assert_eq!(s.services[TEAMVIEWER].shared_with, vec![name(EAOAATI.0)]);
+    assert_eq!(s.services[EAOAATI_TV].shared_with, vec![name(SEPKJ.0)]);
+    assert!(s.services["office printer._ipp._tcp.local"].shared_with.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn cache_flush_does_not_cross_hosts_of_a_shared_instance() {
+    let mut store = Store::new(TIMEOUT);
+    teamviewer_twins(&mut store).await;
+    advance(Duration::from_secs(60)).await;
+    teamviewer_pc(&mut store, EAOAATI);
+    advance(Duration::from_secs(2)).await;
+    let s = snap(&store);
+    let twin = &s.services[TEAMVIEWER];
+    assert_eq!(twin.state, Liveness::Live);
+    let srv_txt: Vec<bool> = twin
+        .records
+        .iter()
+        .filter(|r| matches!(r.data.rtype(), rtype::SRV | rtype::TXT))
+        .map(|r| r.expired)
+        .collect();
+    assert_eq!(srv_txt, vec![false, false], "DESKTOP-28SEPKJ-2's SRV and TXT survive");
+    assert_eq!(dyngate(&s, TEAMVIEWER), SEPKJ.2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cache_flush_still_expires_the_old_srv_of_a_port_change() {
+    let mut store = Store::new(TIMEOUT);
+    let (host, addr, _) = EAOAATI;
+    store.ingest(sent_from(addr, wire(TEAMVIEWER, srv(host, 2020), 120)));
+    advance(Duration::from_secs(5)).await;
+    store.ingest(sent_from(addr, wire(TEAMVIEWER, srv(host, 2021), 120)));
+    advance(Duration::from_millis(1500)).await;
+    let s = snap(&store);
+    assert_eq!(s.services.len(), 1);
+    let svc = &s.services[TEAMVIEWER];
+    assert_eq!(svc.port, Some(2021));
+    let expired: Vec<bool> = svc.records.iter().filter(|r| r.data.rtype() == rtype::SRV).map(|r| r.expired).collect();
+    assert_eq!(expired.iter().filter(|e| **e).count(), 1, "the 2020 SRV is flushed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn silent_twin_is_removed_and_the_shared_ptr_stays() {
+    let mut store = Store::new(TIMEOUT);
+    teamviewer_twins(&mut store).await;
+    // Only DESKTOP-EAOAATI keeps answering, with SRV, TXT and address only.
+    let (host, addr, id) = EAOAATI;
+    for _ in 0..4 {
+        advance(Duration::from_secs(100)).await;
+        store.ingest(sent_from(addr, wire(TEAMVIEWER, srv(host, 2020), 120)));
+        store.ingest(sent_from(addr, wire(TEAMVIEWER, txt(&[&format!("DyngateID={id}")]), 4500)));
+        store.ingest(sent_from(addr, wire(host, RData::A(addr.parse().unwrap()), 120)));
+    }
+    store.gc(Instant::now());
+    let s = snap(&store);
+    assert_eq!(device_labels(&s), vec!["0"]);
+    assert_eq!(s.devices[0].id, "desktop-eaoaati.local");
+    let svc = &s.services[TEAMVIEWER];
+    assert_eq!(svc.state, Liveness::Live);
+    assert!(svc.records.iter().any(|r| r.data.rtype() == rtype::PTR), "the PTR is still there");
+    assert!(svc.shared_with.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn goodbye_from_one_twin_leaves_the_other_live() {
+    let mut store = Store::new(TIMEOUT);
+    teamviewer_twins(&mut store).await;
+    let (host, addr, id) = SEPKJ;
+    store.ingest(sent_from(addr, wire(TEAMVIEWER, srv(host, 2020), 0)));
+    store.ingest(sent_from(addr, wire(TEAMVIEWER, txt(&[&format!("DyngateID={id}")]), 0)));
+    let s = snap(&store);
+    assert_eq!(s.services[TEAMVIEWER].state, Liveness::Left);
+    assert_eq!(s.services[EAOAATI_TV].state, Liveness::Live);
+}
+
+/// A daemon-only record, sent from `src` as the avahi backend reports it.
+fn system_from(src: &str, owner: &str, data: RData) -> Observation {
+    let Observation::Record(mut r) = rec(Source::System, owner, data, None) else {
+        unreachable!()
+    };
+    r.src_addr = Some(src.parse().unwrap());
+    Observation::Record(r)
+}
+
+#[tokio::test(start_paused = true)]
+async fn system_only_txt_assigned_by_resolved_address() {
+    let mut store = Store::new(TIMEOUT);
+    for (host, addr, id) in [SEPKJ, EAOAATI] {
+        let address = match addr.parse::<IpAddr>().unwrap() {
+            IpAddr::V4(a) => RData::A(a),
+            IpAddr::V6(a) => RData::Aaaa(a),
+        };
+        store.ingest(system_from(addr, TEAMVIEWER, srv(host, 2020)));
+        store.ingest(system_from(addr, TEAMVIEWER, txt(&[&format!("DyngateID={id}")])));
+        store.ingest(rec(Source::System, host, address, None));
+    }
+    let s = snap(&store);
+    assert_eq!(s.services.len(), 2);
+    for svc in s.services.values() {
+        let host = svc.host.as_ref().unwrap();
+        let expected = if *host == name(EAOAATI.0) { EAOAATI.2 } else { SEPKJ.2 };
+        assert_eq!(dyngate(&s, &svc.id), expected, "{host}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn wire_source_address_wins_over_the_resolved_one() {
+    let mut store = Store::new(TIMEOUT);
+    let (host, addr, _) = EAOAATI;
+    store.ingest(sent_from(addr, wire(TEAMVIEWER, srv(host, 2020), 120)));
+    store.ingest(system_from("10.9.9.9", TEAMVIEWER, srv(host, 2020)));
+    let s = snap(&store);
+    let srv_rec = s.services[TEAMVIEWER].records.iter().find(|r| r.data.rtype() == rtype::SRV).unwrap();
+    assert_eq!(srv_rec.src_addr, Some(addr.parse().unwrap()));
+}

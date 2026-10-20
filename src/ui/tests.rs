@@ -736,3 +736,93 @@ async fn device_details_list_all_hosts() {
     assert!(s.contains("Hosts     mini-2.local"), "{s}");
     assert!(s.contains("mini.local"), "{s}");
 }
+
+fn teamviewer(store: &mut Store, host: &str, src: IpAddr, dyngate: &str) {
+    let instance = "0._teamviewer._tcp.local";
+    let records = [
+        ("_teamviewer._tcp.local", RData::Ptr(DnsName::parse(instance)), 4500),
+        (instance, RData::Srv { priority: 0, weight: 0, port: 2020, target: DnsName::parse(host) }, 120),
+        (instance, RData::Txt(vec![format!("DyngateID={dyngate}").into_bytes()]), 4500),
+        (host, match src { IpAddr::V4(a) => RData::A(a), IpAddr::V6(a) => RData::Aaaa(a) }, 120),
+    ];
+    for (owner, data, ttl) in records {
+        let Observation::Record(mut r) = wire(owner, data, ttl) else { unreachable!() };
+        r.src_addr = Some(src);
+        r.cache_flush = !matches!(r.data, RData::Ptr(_));
+        store.ingest(Observation::Record(r));
+    }
+}
+
+const EAOAATI: &str = "DESKTOP-EAOAATI.local";
+const SEPKJ: &str = "DESKTOP-28SEPKJ-2.local";
+
+fn eaoaati(store: &mut Store) {
+    teamviewer(store, EAOAATI, "192.168.4.135".parse().unwrap(), "925584742");
+}
+
+fn sepkj(store: &mut Store) {
+    teamviewer(store, SEPKJ, "fe80::c96a:fae5:472d:f9c".parse().unwrap(), "1800894754");
+}
+
+#[tokio::test(start_paused = true)]
+async fn service_view_shows_shared_instance_name() {
+    let mut store = lan();
+    eaoaati(&mut store);
+    advance(Duration::from_secs(1)).await;
+    sepkj(&mut store);
+    let mut a = app(&store);
+    select_device(&mut a, "desktop-eaoaati.local");
+    let s = screen(&a);
+    assert!(s.contains(&format!("Shared name {SEPKJ}")), "{s}");
+    assert!(s.contains("DyngateID  925584742"), "{s}");
+
+    select_device(&mut a, "nas.local");
+    let s = screen(&a);
+    assert!(!s.contains("Shared name"), "{s}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn selection_stays_on_its_host_when_a_twin_appears() {
+    let mut store = lan();
+    sepkj(&mut store);
+    let mut a = app(&store);
+    select_device(&mut a, "desktop-28sepkj-2.local");
+    assert_eq!(a.middle.as_deref(), Some("0._teamviewer._tcp.local"));
+    advance(Duration::from_secs(1)).await;
+    eaoaati(&mut store);
+    a.set_snapshot(Arc::new(store.snapshot(Instant::now())));
+    assert_eq!(a.left.as_deref(), Some("desktop-28sepkj-2.local"));
+    assert_eq!(a.selected_service().unwrap().host, Some(DnsName::parse(SEPKJ)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn selection_stays_on_its_host_when_the_first_twin_is_removed() {
+    let mut store = lan();
+    eaoaati(&mut store);
+    advance(Duration::from_secs(1)).await;
+    sepkj(&mut store);
+    // A second service that sorts before TeamViewer on the same PC.
+    advertise(&mut store, "0", "_anydesk._tcp", SEPKJ, 7070, &[]);
+    let mut a = app(&store);
+    select_device(&mut a, "desktop-28sepkj-2.local");
+    a.focus = Focus::Middle;
+    key(&mut a, KeyCode::Down);
+    let qualified = "0._teamviewer._tcp.local\u{0}desktop-28sepkj-2.local";
+    assert_eq!(a.middle.as_deref(), Some(qualified));
+    // Only DESKTOP-28SEPKJ-2 keeps answering; the rest of the LAN too.
+    for _ in 0..4 {
+        advance(Duration::from_secs(100)).await;
+        sepkj(&mut store);
+        advertise(&mut store, "0", "_anydesk._tcp", SEPKJ, 7070, &[]);
+        for (host, last) in [("brother.local", 40), ("nas.local", 10), ("tv.local", 20)] {
+            address(&mut store, host, last);
+        }
+        store.set_retained(a.retained_ids());
+        store.gc(Instant::now());
+        a.set_snapshot(Arc::new(store.snapshot(Instant::now())));
+    }
+    assert!(a.snapshot.device("desktop-eaoaati.local").is_none(), "the first twin is gone");
+    assert_eq!(a.middle.as_deref(), Some("0._teamviewer._tcp.local"), "the id changed");
+    assert_eq!(a.left.as_deref(), Some("desktop-28sepkj-2.local"));
+    assert_eq!(a.focus, Focus::Middle);
+}

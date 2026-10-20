@@ -56,6 +56,14 @@ lists the services of all its host names, and the service details show a
 address stay separate. If the host names stop sharing an address, the device
 splits again.
 
+### One service name, several machines
+
+Some software announces the same service name on every machine it runs on.
+For example, TeamViewer on two Windows PCs can both announce a service named
+`0`. `mdnsview` shows such a service **once per machine**, each under its own
+device with its own port, addresses and TXT data. The service details show a
+`Shared name` line listing the other host names that announce the same name.
+
 ### How discovery works
 
 `mdnsview` combines two sources:

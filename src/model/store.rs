@@ -98,7 +98,7 @@ impl Store {
         let key = rec.key();
         let at = rec.at;
         if rec.source == Source::Wire && rec.cache_flush && rec.ttl != Some(0) {
-            self.apply_cache_flush(&key, at);
+            self.apply_cache_flush(&key, rec.src_addr, at);
         }
         let entry = self.records.entry(key.clone()).or_insert_with(|| StoredRecord {
             name: rec.name.clone(),
@@ -156,8 +156,10 @@ impl Store {
     }
 
     /// RFC 6762 §10.2: other records of the same name and type that are
-    /// older than one second expire one second from now.
-    fn apply_cache_flush(&mut self, key: &RecordKey, at: Instant) {
+    /// older than one second expire one second from now. SRV and TXT records
+    /// only flush their own host's records, so two hosts announcing the same
+    /// instance name do not flush each other.
+    fn apply_cache_flush(&mut self, key: &RecordKey, src_addr: Option<IpAddr>, at: Instant) {
         let rt = key.data.rtype();
         let Some(siblings) = self.by_owner.get(key.name.key()) else {
             return;
@@ -166,7 +168,13 @@ impl Store {
             if sibling == key || sibling.data.rtype() != rt {
                 continue;
             }
+            if let (RData::Srv { target, .. }, RData::Srv { target: other, .. }) = (&key.data, &sibling.data)
+                && target != other
+            {
+                continue;
+            }
             if let Some(r) = self.records.get_mut(sibling)
+                && !(rt == rtype::TXT && r.src_addr.is_some() && r.src_addr != src_addr)
                 && let Some(seen) = r.wire_seen
                 && at.saturating_duration_since(seen) > CACHE_FLUSH_GRACE
             {
@@ -280,6 +288,7 @@ impl Store {
     pub fn gc(&mut self, now: Instant) {
         let snap = self.snapshot(now);
         let mut remove: HashSet<RecordKey> = HashSet::new();
+        let mut removed_services: HashSet<&str> = HashSet::new();
         let mut attributed: HashSet<&RecordKey> = HashSet::new();
 
         for device in &snap.devices {
@@ -287,23 +296,18 @@ impl Store {
             for sid in &device.services {
                 attributed.extend(snap.services[sid].own_keys.iter());
             }
-            let services_of = |ids: &[String]| -> Vec<RecordKey> {
-                ids.iter()
-                    .flat_map(|sid| snap.services[sid].own_keys.iter().cloned())
-                    .collect()
-            };
             if device.gone {
                 if device.retained {
                     continue;
                 }
                 remove.extend(device.host_keys.iter().cloned());
-                let unretained: Vec<String> = device
-                    .services
-                    .iter()
-                    .filter(|sid| !snap.services[*sid].retained)
-                    .cloned()
-                    .collect();
-                remove.extend(services_of(&unretained));
+                removed_services.extend(
+                    device
+                        .services
+                        .iter()
+                        .filter(|sid| !snap.services[*sid].retained)
+                        .map(String::as_str),
+                );
                 continue;
             }
             // A live device: drop host names that went silent on their own,
@@ -320,15 +324,26 @@ impl Store {
                     held_services.extend(member.services.iter());
                 } else {
                     remove.extend(member.host_keys.iter().cloned());
-                    remove.extend(services_of(&member.services));
+                    removed_services.extend(member.services.iter().map(String::as_str));
                 }
             }
             for sid in &device.services {
                 let service = &snap.services[sid];
                 if service.gone && !service.retained && !held_services.contains(sid) {
-                    remove.extend(service.own_keys.iter().cloned());
+                    removed_services.insert(sid);
                 }
             }
+        }
+        // Records shared by services of one instance name, such as its PTR,
+        // stay while a service that uses them stays.
+        let kept: HashSet<&RecordKey> = snap
+            .services
+            .values()
+            .filter(|s| !removed_services.contains(s.id.as_str()))
+            .flat_map(|s| s.own_keys.iter())
+            .collect();
+        for sid in &removed_services {
+            remove.extend(snap.services[*sid].own_keys.iter().filter(|k| !kept.contains(k)).cloned());
         }
         // Records not part of any device: browse PTRs for types, device-info, ...
         for (key, r) in &self.records {

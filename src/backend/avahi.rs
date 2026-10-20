@@ -180,7 +180,7 @@ async fn handle_signal(conn: &Connection, state: &mut State, msg: &Message) -> V
             }
             let meta = DnsName::parse(&format!("_services._dns-sd._udp.{domain}"));
             let type_name = DnsName::parse(&format!("{service_type}.{domain}"));
-            vec![observe(meta, RData::Ptr(type_name), None)]
+            vec![observe(meta, RData::Ptr(type_name), None, None)]
         }
         (SERVICE_BROWSER, "ItemNew") => {
             let Ok((ifindex, proto, name, service_type, domain, _)) =
@@ -221,7 +221,7 @@ async fn handle_signal(conn: &Connection, state: &mut State, msg: &Message) -> V
             }
             let iface_name = interface_name(conn, state, ifindex).await;
             let type_name = instance.parent();
-            vec![observe(type_name, RData::Ptr(instance), iface_name)]
+            vec![observe(type_name, RData::Ptr(instance), iface_name, None)]
         }
         (SERVICE_BROWSER, "ItemRemove") => {
             let Ok((ifindex, proto, name, service_type, domain, _)) =
@@ -275,6 +275,10 @@ async fn handle_signal(conn: &Connection, state: &mut State, msg: &Message) -> V
             let iface_name = interface_name(conn, state, ifindex).await;
             let instance = instance_name(&name, &service_type, &domain);
             let host = DnsName::parse(&host);
+            let parsed = address.parse::<IpAddr>();
+            // The resolved address stands in for the sender, so the TXT of
+            // an instance name shared by several hosts can be told apart.
+            let src = parsed.as_ref().ok().copied();
             let mut out = vec![
                 observe(
                     instance.clone(),
@@ -285,12 +289,13 @@ async fn handle_signal(conn: &Connection, state: &mut State, msg: &Message) -> V
                         target: host.clone(),
                     },
                     iface_name.clone(),
+                    src,
                 ),
-                observe(instance, RData::Txt(txt), iface_name.clone()),
+                observe(instance, RData::Txt(txt), iface_name.clone(), src),
             ];
-            match address.parse::<IpAddr>() {
-                Ok(IpAddr::V4(a)) => out.push(observe(host, RData::A(a), iface_name)),
-                Ok(IpAddr::V6(a)) => out.push(observe(host, RData::Aaaa(a), iface_name)),
+            match parsed {
+                Ok(IpAddr::V4(a)) => out.push(observe(host, RData::A(a), iface_name, None)),
+                Ok(IpAddr::V6(a)) => out.push(observe(host, RData::Aaaa(a), iface_name, None)),
                 Err(_) => debug!("unparsable address {address:?} for {host}"),
             }
             out
@@ -326,14 +331,14 @@ async fn interface_name(conn: &Connection, state: &mut State, index: i32) -> Opt
     Some(name)
 }
 
-fn observe(name: DnsName, data: RData, iface: Option<String>) -> Observation {
+fn observe(name: DnsName, data: RData, iface: Option<String>, src_addr: Option<IpAddr>) -> Observation {
     Observation::Record(ObservedRecord {
         name,
         data,
         ttl: None,
         cache_flush: false,
         source: Source::System,
-        src_addr: None,
+        src_addr,
         iface,
         at: Instant::now(),
         wall: SystemTime::now(),

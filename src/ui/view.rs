@@ -173,7 +173,7 @@ fn render_middle(frame: &mut Frame, app: &App, area: Rect, now: Instant) -> (Rec
 
 fn field(name: &str, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{name:<10}"), DIM),
+        Span::styled(format!("{name:<9} "), DIM),
         Span::raw(value.into()),
     ])
 }
@@ -222,6 +222,10 @@ fn simple_service(s: &Service, device: Option<&Device>, now: Instant) -> Vec<Lin
     if let Some(d) = device.filter(|d| d.hosts.len() > 1) {
         let hosts: Vec<String> = d.hosts.iter().map(|h| h.to_string()).collect();
         lines.push(field("Device", hosts.join(", ")));
+    }
+    if !s.shared_with.is_empty() {
+        let hosts: Vec<String> = s.shared_with.iter().map(|h| h.to_string()).collect();
+        lines.push(field("Shared name", hosts.join(", ")));
     }
     if s.addresses.is_empty() {
         lines.push(field("Addresses", "-"));
