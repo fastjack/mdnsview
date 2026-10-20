@@ -393,11 +393,99 @@ async fn refinement_requested_for_daemon_only_instances() {
     assert_eq!(q[0].name, name("p.local"));
     assert_eq!(q[0].rtypes, vec![rtype::A, rtype::AAAA]);
 
-    // Once the wire has the SRV record, no more requests for the instance.
+    // Once the wire has the SRV record, only the TXT record is still asked for.
     store.ingest(wire("P._ipp._tcp.local", srv("p.local", 631), 120));
     advance(Duration::from_secs(31)).await;
     let q = store.ingest(rec(Source::System, "_ipp._tcp.local", ptr("P._ipp._tcp.local"), None));
-    assert!(q.is_empty());
+    assert_eq!(q[0].rtypes, vec![rtype::TXT]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn srv_received_without_txt_requests_only_txt() {
+    let mut store = Store::new(TIMEOUT);
+    // A truncated answer carried the SRV record but not the TXT record.
+    store.ingest(wire("P._ipp._tcp.local", srv("p.local", 631), 120));
+    let q = store.ingest(rec(Source::System, "_ipp._tcp.local", ptr("P._ipp._tcp.local"), None));
+    assert_eq!(
+        q,
+        vec![QueryRequest {
+            name: name("P._ipp._tcp.local"),
+            rtypes: vec![rtype::TXT],
+        }]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn fully_answered_instance_needs_no_refinement() {
+    let mut store = Store::new(TIMEOUT);
+    let q = store.ingest(wire("_ipp._tcp.local", ptr("P._ipp._tcp.local"), 4500));
+    assert_eq!(q[0].rtypes, vec![rtype::SRV, rtype::TXT]);
+    assert!(store.ingest(wire("P._ipp._tcp.local", txt(&["txtvers=1"]), 4500)).is_empty());
+    store.ingest(wire("p.local", a(40), 120));
+    assert!(store.ingest(wire("P._ipp._tcp.local", srv("p.local", 631), 120)).is_empty());
+    advance(Duration::from_secs(2)).await;
+    assert!(store.due_refinements(Instant::now()).is_empty());
+}
+
+/// Seconds (from the first request) at which `due_refinements` asks again,
+/// checked every second up to `until`.
+async fn retry_times(store: &mut Store, until: u64) -> Vec<u64> {
+    let mut times = Vec::new();
+    for t in 1..=until {
+        advance(Duration::from_secs(1)).await;
+        if !store.due_refinements(Instant::now()).is_empty() {
+            times.push(t);
+        }
+    }
+    times
+}
+
+#[tokio::test(start_paused = true)]
+async fn unanswered_refinement_is_retried_with_backoff() {
+    let mut store = Store::new(TIMEOUT);
+    let q = store.ingest(rec(Source::System, "_ipp._tcp.local", ptr("P._ipp._tcp.local"), None));
+    assert_eq!(q.len(), 1);
+    // First request at 0 s, retries at 2 s, 10 s and 40 s, then nothing.
+    assert_eq!(retry_times(&mut store, 100).await, vec![2, 10, 40]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retries_ask_only_for_what_is_missing_and_stop_once_answered() {
+    let mut store = Store::new(TIMEOUT);
+    store.ingest(rec(Source::System, "_ipp._tcp.local", ptr("P._ipp._tcp.local"), None));
+    store.ingest(wire("p.local", a(40), 120));
+    store.ingest(wire("P._ipp._tcp.local", srv("p.local", 631), 120));
+    advance(Duration::from_secs(2)).await;
+    let q = store.due_refinements(Instant::now());
+    assert_eq!(
+        q,
+        vec![QueryRequest {
+            name: name("P._ipp._tcp.local"),
+            rtypes: vec![rtype::TXT],
+        }]
+    );
+    store.ingest(wire("P._ipp._tcp.local", txt(&["txtvers=1"]), 4500));
+    assert!(retry_times(&mut store, 60).await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn host_with_only_an_a_record_is_not_retried() {
+    let mut store = Store::new(TIMEOUT);
+    let q = store.ingest(rec(Source::System, "P._ipp._tcp.local", srv("p.local", 631), None));
+    assert_eq!(q[0].rtypes, vec![rtype::A, rtype::AAAA]);
+    store.ingest(wire("p.local", a(40), 120));
+    assert!(retry_times(&mut store, 60).await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn reingest_is_throttled_while_a_round_runs() {
+    let mut store = Store::new(TIMEOUT);
+    let ptr_obs = || rec(Source::System, "_ipp._tcp.local", ptr("P._ipp._tcp.local"), None);
+    assert_eq!(store.ingest(ptr_obs()).len(), 1);
+    advance(Duration::from_secs(5)).await;
+    assert!(store.ingest(ptr_obs()).is_empty(), "throttled within 30 s");
+    advance(Duration::from_secs(26)).await;
+    assert_eq!(store.ingest(ptr_obs()).len(), 1, "new round after 30 s");
 }
 
 #[tokio::test(start_paused = true)]
@@ -421,6 +509,25 @@ async fn store_task_publishes_snapshots_and_queries() {
     handle.retain.send(vec![UNRESOLVED_ID.to_string()]).unwrap();
     handle.snapshots.changed().await.unwrap();
     assert!(handle.snapshots.borrow().devices[0].retained);
+}
+
+#[tokio::test(start_paused = true)]
+async fn store_task_sends_refinement_retries() {
+    let (qtx, mut qrx) = tokio::sync::mpsc::unbounded_channel();
+    let (handle, _task) = spawn(TIMEOUT, Some(qtx));
+    handle
+        .observations
+        .send(rec(Source::System, "_ipp._tcp.local", ptr("P._ipp._tcp.local"), None))
+        .await
+        .unwrap();
+    let first = qrx.recv().await.unwrap();
+    assert_eq!(first.name, name("P._ipp._tcp.local"));
+    let sent = Instant::now();
+    // Unanswered: the retry arrives on the next GC tick after 2 s.
+    let retry = qrx.recv().await.unwrap();
+    assert_eq!(retry, first);
+    let after = Instant::now().duration_since(sent);
+    assert!(after >= Duration::from_secs(2) && after <= Duration::from_secs(3), "{after:?}");
 }
 
 fn aaaa(text: &str) -> RData {

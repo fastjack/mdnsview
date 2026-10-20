@@ -15,12 +15,36 @@ use super::snapshot::{DeriveInput, Snapshot, Status, derive};
 
 /// How long a superseded record lives after a cache-flush (RFC 6762 §10.2).
 const CACHE_FLUSH_GRACE: Duration = Duration::from_secs(1);
-/// Minimum interval between refinement requests for the same name.
+/// Minimum interval between refinement rounds for the same name.
 const REFINE_INTERVAL: Duration = Duration::from_secs(30);
+/// Delays before each retry of a refinement request that is still missing
+/// records. Longer than the scheduler's 1 s dedup, so no retry is swallowed.
+const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(8),
+    Duration::from_secs(30),
+];
 /// Snapshots are published at most this often.
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 /// Liveness and garbage collection are re-evaluated this often.
 const GC_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What a refined name is, which decides the record types it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefineKind {
+    Instance,
+    Host,
+}
+
+/// One refinement round for a name: the first request and its retries.
+struct Refinement {
+    kind: RefineKind,
+    /// When the round started.
+    requested: Instant,
+    retries: usize,
+    /// `None` once every retry has been sent.
+    next_retry: Option<Instant>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredRecord {
@@ -57,7 +81,7 @@ pub struct Store {
     timeout: Duration,
     retained: HashSet<String>,
     status: Status,
-    refine_requested: HashMap<DnsName, Instant>,
+    refinements: HashMap<DnsName, Refinement>,
 }
 
 impl Store {
@@ -68,7 +92,7 @@ impl Store {
             timeout,
             retained: HashSet::new(),
             status: Status::default(),
-            refine_requested: HashMap::new(),
+            refinements: HashMap::new(),
         }
     }
 
@@ -193,30 +217,74 @@ impl Store {
         })
     }
 
+    /// Record types of `name` still to be fetched on the wire. An instance
+    /// needs both SRV and TXT; a host needs an A or an AAAA record.
+    fn missing(&self, kind: RefineKind, name: &DnsName) -> Vec<u16> {
+        match kind {
+            RefineKind::Instance => [rtype::SRV, rtype::TXT]
+                .into_iter()
+                .filter(|rt| !self.has_wire(name, &[*rt]))
+                .collect(),
+            RefineKind::Host if self.has_wire(name, &[rtype::A, rtype::AAAA]) => Vec::new(),
+            RefineKind::Host => vec![rtype::A, rtype::AAAA],
+        }
+    }
+
     /// Asks for wire data about names we only know from the daemon, or
-    /// whose SRV / address records have not been seen on the wire yet.
+    /// whose SRV / TXT / address records have not been seen on the wire yet.
     fn refinements(&mut self, data: &RData, at: Instant) -> Vec<QueryRequest> {
-        let (name, rtypes, satisfied_by): (_, _, &[u16]) = match data {
+        let (name, kind) = match data {
             RData::Ptr(instance) if instance.is_service_instance() => {
-                (instance.clone(), vec![rtype::SRV, rtype::TXT], &[rtype::SRV])
+                (instance.clone(), RefineKind::Instance)
             }
-            RData::Srv { target, .. } => (
-                target.clone(),
-                vec![rtype::A, rtype::AAAA],
-                &[rtype::A, rtype::AAAA],
-            ),
+            RData::Srv { target, .. } => (target.clone(), RefineKind::Host),
             _ => return Vec::new(),
         };
-        if self.has_wire(&name, satisfied_by) {
+        let rtypes = self.missing(kind, &name);
+        if rtypes.is_empty() {
             return Vec::new();
         }
-        if let Some(last) = self.refine_requested.get(&name)
-            && at.saturating_duration_since(*last) < REFINE_INTERVAL
+        if let Some(round) = self.refinements.get(&name)
+            && at.saturating_duration_since(round.requested) < REFINE_INTERVAL
         {
             return Vec::new();
         }
-        self.refine_requested.insert(name.clone(), at);
+        self.refinements.insert(
+            name.clone(),
+            Refinement {
+                kind,
+                requested: at,
+                retries: 0,
+                next_retry: Some(at + RETRY_DELAYS[0]),
+            },
+        );
         vec![QueryRequest { name, rtypes }]
+    }
+
+    /// Retries due refinement requests for names still missing records.
+    /// Names that are complete are dropped.
+    pub fn due_refinements(&mut self, now: Instant) -> Vec<QueryRequest> {
+        let due: Vec<(DnsName, RefineKind)> = self
+            .refinements
+            .iter()
+            .filter(|(_, r)| r.next_retry.is_some_and(|t| t <= now))
+            .map(|(name, r)| (name.clone(), r.kind))
+            .collect();
+        let mut out = Vec::new();
+        for (name, kind) in due {
+            let rtypes = self.missing(kind, &name);
+            if rtypes.is_empty() {
+                self.refinements.remove(&name);
+                continue;
+            }
+            if let Some(round) = self.refinements.get_mut(&name) {
+                round.retries += 1;
+                round.next_retry = RETRY_DELAYS.get(round.retries).map(|d| now + *d);
+                tracing::debug!("refinement retry {} for {name}: {rtypes:?}", round.retries);
+            }
+            out.push(QueryRequest { name, rtypes });
+        }
+        out
     }
 
     fn system_removed(&mut self, instance: &DnsName, at: Instant) {
@@ -363,8 +431,9 @@ impl Store {
                 }
             }
         }
-        self.refine_requested
-            .retain(|_, at| now.saturating_duration_since(*at) < REFINE_INTERVAL);
+        self.refinements.retain(|_, r| {
+            r.next_retry.is_some() || now.saturating_duration_since(r.requested) < REFINE_INTERVAL
+        });
     }
 
     #[cfg(test)]
@@ -417,11 +486,7 @@ async fn run(
         tokio::select! {
             obs = observations.recv() => {
                 let Some(obs) = obs else { break };
-                for q in store.ingest(obs) {
-                    if let Some(tx) = &queries {
-                        let _ = tx.send(q);
-                    }
-                }
+                send_queries(&queries, store.ingest(obs));
                 dirty = true;
             }
             ids = retain.recv(), if retain_open => {
@@ -443,9 +508,19 @@ async fn run(
                 }
             }
             _ = gc.tick() => {
-                store.gc(Instant::now());
+                let now = Instant::now();
+                store.gc(now);
+                send_queries(&queries, store.due_refinements(now));
                 dirty = true;
             }
+        }
+    }
+}
+
+fn send_queries(queries: &Option<mpsc::UnboundedSender<QueryRequest>>, requests: Vec<QueryRequest>) {
+    if let Some(tx) = queries {
+        for q in requests {
+            let _ = tx.send(q);
         }
     }
 }
