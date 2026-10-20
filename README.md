@@ -2,12 +2,80 @@
 
 A terminal browser for mDNS / DNS-SD devices and services on the local network.
 
+## Installation
+
+Cargo's counterpart to `make install` is `cargo install`. From the checkout:
+
+```sh
+cargo install --path . --locked
+```
+
+This builds a release binary and copies it to `~/.cargo/bin/mdnsview`
+(`$CARGO_HOME/bin` if `CARGO_HOME` is set). `--locked` builds with the
+dependency versions in `Cargo.lock`; without it, `cargo install` ignores the
+lock file and may pick newer versions.
+
+Check that your shell finds it:
+
+```sh
+command -v mdnsview
+```
+
+If that prints nothing, `~/.cargo/bin` is not on your `PATH`. Installing Rust
+with rustup adds it, but Homebrew's or a distribution's Rust may not. Add this
+line to `~/.zshrc` or `~/.bashrc` and open a new terminal:
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+A shell that was already open may still remember that `mdnsview` was not
+found; run `rehash` (zsh) or `hash -r` (bash) there.
+
+**Somewhere else.** Like `make install PREFIX=...`, `--root` picks the
+directory; the binary goes into its `bin` subdirectory:
+
+```sh
+cargo install --path . --locked --root ~/.local   # installs ~/.local/bin/mdnsview
+```
+
+**For all users.** Build as yourself and copy the binary; don't run cargo with
+`sudo`, which would leave root-owned files in the checkout and in `~/.cargo`:
+
+```sh
+cargo build --release --locked
+sudo install -m 755 target/release/mdnsview /usr/local/bin/
+```
+
+**Updating.** Pull the new sources and run the same `cargo install` command
+again; it rebuilds and replaces the installed binary.
+
+**Uninstalling.**
+
+```sh
+cargo uninstall mdnsview                   # add --root ~/.local if you used it
+sudo rm /usr/local/bin/mdnsview            # for the copy made with sudo install
+```
+
+**On Windows**, run the same `cargo install --path . --locked` in PowerShell.
+It installs `%USERPROFILE%\.cargo\bin\mdnsview.exe`; the rustup installer
+already put that directory on your user `PATH`. Check with
+`Get-Command mdnsview` in a new terminal (one opened before the install does
+not see `PATH` changes). Updating and `cargo uninstall mdnsview` work as
+above; the `PATH` line, `rehash` and `sudo install` steps do not apply.
+
 ## Usage
+
+```sh
+mdnsview
+mdnsview --config ./my-config.toml
+```
+
+To run it from the checkout without installing:
 
 ```sh
 cargo build --release
 ./target/release/mdnsview
-./target/release/mdnsview --config ./my-config.toml
 ```
 
 On Windows, run `.\target\release\mdnsview.exe` in Windows Terminal or a
