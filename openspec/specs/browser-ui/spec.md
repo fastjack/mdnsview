@@ -156,6 +156,8 @@ The UI SHALL show a status bar with:
 - whether mouse capture is on or off
 - a short key hint
 
+When discovery reports that Windows Firewall seems to block incoming mDNS, the sources entry SHALL carry a hint naming Windows Firewall.
+
 #### Scenario: Avahi missing
 - **WHEN** the OS daemon is unavailable
 - **THEN** the status bar shows "wire only"
@@ -163,6 +165,14 @@ The UI SHALL show a status bar with:
 #### Scenario: Mouse state shown
 - **WHEN** the user turns mouse capture off with `m`
 - **THEN** the status bar shows that the mouse is off
+
+#### Scenario: Firewall hint shown
+- **WHEN** on Windows discovery reports that Windows Firewall seems to block incoming mDNS
+- **THEN** the status bar shows "Windows DNS + wire (no replies: check Windows Firewall)"
+
+#### Scenario: Firewall hint cleared
+- **WHEN** the firewall report is withdrawn
+- **THEN** the status bar shows "Windows DNS + wire" without the hint
 
 ### Requirement: Click to select
 While mouse capture is on, a left click on a row in the left or middle pane SHALL focus that pane and select the clicked entry, with the same effect as moving the selection there with the keyboard. A click inside a pane but outside its rows SHALL only focus that pane. A left click in the details pane SHALL focus it.
