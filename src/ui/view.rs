@@ -6,11 +6,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use tokio::time::Instant;
 
 use super::app::{App, DetailMode, Focus, HitMap, LeftItem, Mode};
-use crate::model::record::{RData, rtype};
+use crate::model::record::{InterfaceSelection, RData, rtype};
 use crate::model::snapshot::{Device, Liveness, RecordView, Service, txt_entries};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
@@ -30,6 +30,7 @@ pub fn render(frame: &mut Frame, app: &App, system_name: &str) -> HitMap {
     let (middle_rows, middle_offset) = render_middle(frame, app, middle, now);
     render_details(frame, app, right, now);
     render_status(frame, app, status, system_name);
+    render_picker(frame, app, main);
     HitMap {
         left,
         middle,
@@ -364,6 +365,46 @@ pub fn clock(t: SystemTime) -> String {
     }
 }
 
+/// The interface picker, centred over the panes.
+fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(picker) = &app.picker else {
+        return;
+    };
+    let lines: Vec<Line<'static>> = app
+        .picker_rows()
+        .into_iter()
+        .map(|row| {
+            let mark = if row.checked { "[x] " } else { "[ ] " };
+            let mut spans = vec![Span::raw(mark)];
+            match row.name {
+                None => spans.push(Span::raw("All interfaces")),
+                Some(name) => {
+                    spans.push(Span::raw(format!("{name:<12}")));
+                    if row.unavailable {
+                        spans.push(Span::styled(" unavailable", DIM));
+                    } else {
+                        let addresses: Vec<String> = row.addresses.iter().map(|a| a.to_string()).collect();
+                        spans.push(Span::styled(format!(" {}", addresses.join(", ")), DIM));
+                    }
+                }
+            }
+            Line::from(spans)
+        })
+        .collect();
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = (widest as u16 + 4).max(30).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let items = lines.into_iter().map(ListItem::new).collect();
+    render_list(frame, popup, block("Interfaces", true), items, Some(picker.cursor), true);
+}
+
 fn render_status(frame: &mut Frame, app: &App, area: Rect, system_name: &str) {
     let mut spans = Vec::new();
     if app.editing_filter || !app.filter.is_empty() {
@@ -386,20 +427,38 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, system_name: &str) {
     };
     spans.push(Span::raw(status.sources_label(system_name)));
     spans.push(Span::styled(" │ ", DIM));
-    spans.push(Span::raw(format!(
-        "{} interface{}",
-        status.interfaces.len(),
-        if status.interfaces.len() == 1 { "" } else { "s" }
-    )));
+    let count = match status.selection {
+        InterfaceSelection::All => status.active.len().to_string(),
+        InterfaceSelection::Only(_) => format!("{} of {}", status.active.len(), status.eligible.len()),
+    };
+    let plural = match status.selection {
+        InterfaceSelection::All if status.active.len() == 1 => "",
+        InterfaceSelection::Only(_) if status.eligible.len() == 1 => "",
+        _ => "s",
+    };
+    spans.push(Span::raw(format!("{count} interface{plural}")));
     spans.push(Span::styled(" │ ", DIM));
     spans.push(Span::raw(format!("{devices} device{}", if devices == 1 { "" } else { "s" })));
     spans.push(Span::styled(" │ ", DIM));
     spans.push(Span::raw(if app.mouse { "mouse on" } else { "mouse off" }));
     spans.push(Span::styled(" │ ", DIM));
-    let hints: &[(&str, &str)] = if app.editing_filter {
+    if app.picker.as_ref().is_some_and(|p| p.error) {
+        spans.push(Span::styled("check at least one entry", Style::new().fg(Color::Yellow)));
+        spans.push(Span::styled(" │ ", DIM));
+    }
+    let hints: &[(&str, &str)] = if app.picker.is_some() {
+        &[("space", "toggle"), ("a", "all"), ("enter", "apply"), ("esc", "cancel")]
+    } else if app.editing_filter {
         &[("enter", "apply"), ("esc", "clear")]
     } else {
-        &[("tab", "pivot"), ("/", "filter"), ("d", "details"), ("m", "mouse"), ("q", "quit")]
+        &[
+            ("tab", "pivot"),
+            ("/", "filter"),
+            ("d", "details"),
+            ("i", "interfaces"),
+            ("m", "mouse"),
+            ("q", "quit"),
+        ]
     };
     for (i, (key, what)) in hints.iter().enumerate() {
         if i > 0 {

@@ -13,7 +13,9 @@ use tokio::time::{Instant, advance};
 
 use super::app::{App, DetailMode, Focus, HitMap, Mode};
 use super::view;
-use crate::model::record::{DnsName, Observation, ObservedRecord, RData, Source, SourceState};
+use crate::model::record::{
+    DnsName, InterfaceInfo, InterfaceSelection, Observation, ObservedRecord, RData, Source, SourceState,
+};
 use crate::model::store::Store;
 
 const TIMEOUT: Duration = Duration::from_secs(300);
@@ -64,7 +66,11 @@ fn lan() -> Store {
             state: status.1,
         });
     }
-    store.ingest(Observation::Interfaces(vec!["wlan0".into()]));
+    store.ingest(Observation::Interfaces {
+        eligible: vec![InterfaceInfo { name: "wlan0".into(), addresses: Vec::new() }],
+        active: vec!["wlan0".into()],
+        selection: InterfaceSelection::All,
+    });
     advertise(&mut store, "Office Printer", "_ipp._tcp", "brother.local", 631, &[b"ty=Brother HL", b"note=2nd floor", b"bin=\x01\x02"]);
     advertise(&mut store, "Office Printer", "_http._tcp", "brother.local", 80, &[]);
     address(&mut store, "brother.local", 40);
@@ -825,4 +831,218 @@ async fn selection_stays_on_its_host_when_the_first_twin_is_removed() {
     assert_eq!(a.middle.as_deref(), Some("0._teamviewer._tcp.local"), "the id changed");
     assert_eq!(a.left.as_deref(), Some("desktop-28sepkj-2.local"));
     assert_eq!(a.focus, Focus::Middle);
+}
+
+fn interfaces(store: &mut Store, eligible: &[&str], selection: InterfaceSelection) {
+    store.ingest(Observation::Interfaces {
+        eligible: eligible
+            .iter()
+            .enumerate()
+            .map(|(i, name)| InterfaceInfo {
+                name: name.to_string(),
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(10, 0, i as u8, 1))],
+            })
+            .collect(),
+        active: eligible.iter().filter(|n| selection.includes(n)).map(|n| n.to_string()).collect(),
+        selection,
+    });
+}
+
+fn only(names: &[&str]) -> InterfaceSelection {
+    InterfaceSelection::Only(names.iter().map(|n| n.to_string()).collect())
+}
+
+/// (name, checked, unavailable) of each picker row; `None` is "All interfaces".
+fn picker_rows(app: &App) -> Vec<(Option<String>, bool, bool)> {
+    app.picker_rows().into_iter().map(|r| (r.name, r.checked, r.unavailable)).collect()
+}
+
+/// The LAN with wlan0 and enp3s0 eligible (veth1a2b excluded by the default patterns).
+fn two_networks() -> Store {
+    let mut store = lan();
+    interfaces(&mut store, &["enp3s0", "wlan0"], InterfaceSelection::All);
+    store
+}
+
+#[tokio::test(start_paused = true)]
+async fn picker_lists_eligible_interfaces() {
+    let mut a = app(&two_networks());
+    key(&mut a, KeyCode::Char('i'));
+    assert_eq!(
+        picker_rows(&a),
+        vec![
+            (None, true, false),
+            (Some("enp3s0".into()), false, false),
+            (Some("wlan0".into()), false, false),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn picker_marks_absent_selected_interface() {
+    let mut store = lan();
+    interfaces(&mut store, &["enp3s0"], only(&["wlan0"]));
+    let mut a = app(&store);
+    key(&mut a, KeyCode::Char('i'));
+    assert_eq!(
+        picker_rows(&a),
+        vec![
+            (None, false, false),
+            (Some("enp3s0".into()), false, false),
+            (Some("wlan0".into()), true, true),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn picker_pick_one_then_several_then_all() {
+    let mut a = app(&two_networks());
+    key(&mut a, KeyCode::Char('i'));
+    key(&mut a, KeyCode::Down);
+    key(&mut a, KeyCode::Char(' '));
+    assert!(!picker_rows(&a)[0].1, "checking one unchecks All");
+    assert!(picker_rows(&a)[1].1);
+
+    key(&mut a, KeyCode::Char('j'));
+    key(&mut a, KeyCode::Char(' '));
+    assert_eq!(picker_rows(&a).iter().filter(|r| r.1).count(), 2);
+
+    key(&mut a, KeyCode::Char('a'));
+    assert_eq!(picker_rows(&a), vec![
+        (None, true, false),
+        (Some("enp3s0".into()), false, false),
+        (Some("wlan0".into()), false, false),
+    ]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn picker_checking_all_unchecks_single_interfaces() {
+    let mut a = app(&two_networks());
+    key(&mut a, KeyCode::Char('i'));
+    key(&mut a, KeyCode::Down);
+    key(&mut a, KeyCode::Char(' '));
+    key(&mut a, KeyCode::Up);
+    key(&mut a, KeyCode::Char(' '));
+    assert_eq!(picker_rows(&a).iter().filter(|r| r.1).count(), 1);
+    assert!(picker_rows(&a)[0].1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn picker_apply_and_cancel() {
+    let mut a = app(&two_networks());
+    key(&mut a, KeyCode::Char('i'));
+    key(&mut a, KeyCode::Down);
+    key(&mut a, KeyCode::Char(' '));
+    key(&mut a, KeyCode::Esc);
+    assert!(a.picker.is_none());
+    assert_eq!(a.selection_request, None, "esc changes nothing");
+
+    key(&mut a, KeyCode::Char('i'));
+    assert!(picker_rows(&a)[0].1, "reopened from the current selection");
+    key(&mut a, KeyCode::Down);
+    key(&mut a, KeyCode::Char(' '));
+    key(&mut a, KeyCode::Enter);
+    assert!(a.picker.is_none());
+    assert_eq!(a.selection_request, Some(only(&["enp3s0"])));
+}
+
+#[tokio::test(start_paused = true)]
+async fn picker_apply_all() {
+    let mut store = lan();
+    interfaces(&mut store, &["enp3s0", "wlan0"], only(&["enp3s0"]));
+    let mut a = app(&store);
+    key(&mut a, KeyCode::Char('i'));
+    key(&mut a, KeyCode::Char('a'));
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.selection_request, Some(InterfaceSelection::All));
+}
+
+#[tokio::test(start_paused = true)]
+async fn picker_refuses_empty_selection() {
+    let mut a = app(&two_networks());
+    key(&mut a, KeyCode::Char('i'));
+    key(&mut a, KeyCode::Char(' ')); // uncheck All
+    key(&mut a, KeyCode::Enter);
+    assert!(a.picker.as_ref().is_some_and(|p| p.error));
+    assert_eq!(a.selection_request, None);
+    key(&mut a, KeyCode::Char(' '));
+    assert!(a.picker.as_ref().is_some_and(|p| !p.error), "a change clears the hint");
+}
+
+#[tokio::test(start_paused = true)]
+async fn picker_keeps_keys_from_the_panes() {
+    let mut a = app(&two_networks());
+    let left = a.left.clone();
+    key(&mut a, KeyCode::Char('i'));
+    for c in ['q', 'm', 'd', '/', 'l'] {
+        key(&mut a, KeyCode::Char(c));
+    }
+    key(&mut a, KeyCode::Tab);
+    assert!(!a.quit);
+    assert!(a.picker.is_some());
+    assert!(a.mouse);
+    assert_eq!(a.detail, DetailMode::Simple);
+    assert!(!a.editing_filter);
+    assert_eq!(a.focus, Focus::Left);
+    assert_eq!(a.mode, Mode::Devices);
+    assert_eq!(a.left, left);
+}
+
+#[tokio::test(start_paused = true)]
+async fn picker_ignores_mouse() {
+    let mut a = app(&two_networks());
+    let hits = HitMap {
+        left: Rect::new(0, 0, 40, 20),
+        left_rows: Rect::new(1, 1, 38, 18),
+        ..HitMap::default()
+    };
+    key(&mut a, KeyCode::Char('i'));
+    let left = a.left.clone();
+    a.on_mouse(
+        MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 2, row: 2, modifiers: KeyModifiers::NONE },
+        &hits,
+    );
+    assert_eq!(a.left, left);
+}
+
+#[tokio::test(start_paused = true)]
+async fn i_in_filter_prompt_is_text() {
+    let mut a = app(&two_networks());
+    key(&mut a, KeyCode::Char('/'));
+    keys(&mut a, "liv");
+    assert!(a.picker.is_none());
+    assert_eq!(a.filter, "liv");
+}
+
+#[tokio::test(start_paused = true)]
+async fn picker_overlay_contents() {
+    let mut store = lan();
+    interfaces(&mut store, &["enp3s0", "wlan0"], only(&["enp3s0", "wlan1"]));
+    let mut a = app(&store);
+    key(&mut a, KeyCode::Char('i'));
+    let s = screen(&a);
+    assert!(s.contains("Interfaces"), "{s}");
+    assert!(s.contains("[ ] All interfaces"), "{s}");
+    assert!(s.contains("[x] enp3s0       10.0.0.1"), "{s}");
+    assert!(s.contains("[ ] wlan0        10.0.1.1"), "{s}");
+    assert!(s.contains("[x] wlan1        unavailable"), "{s}");
+    assert!(!s.contains("veth"), "{s}");
+    assert!(s.contains("space toggle  a all  enter apply  esc cancel"), "{s}");
+
+    key(&mut a, KeyCode::Char(' ')); // check All
+    key(&mut a, KeyCode::Char(' ')); // uncheck All: nothing checked
+    key(&mut a, KeyCode::Enter);
+    assert!(screen(&a).contains("check at least one entry"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_bar_interface_count() {
+    let mut store = lan();
+    interfaces(&mut store, &["enp3s0", "wlan0"], InterfaceSelection::All);
+    let s = screen(&app(&store));
+    assert!(s.contains("│ 2 interfaces │"), "{s}");
+    assert!(s.contains("i interfaces"), "{s}");
+
+    interfaces(&mut store, &["enp3s0", "tailscale0", "wlan0"], only(&["enp3s0"]));
+    assert!(screen(&app(&store)).contains("│ 1 of 3 interfaces │"));
 }

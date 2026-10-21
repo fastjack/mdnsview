@@ -12,8 +12,10 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
 use ratatui::crossterm::execute;
+use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
+use crate::model::record::InterfaceSelection;
 use crate::model::store::StoreHandle;
 use app::App;
 
@@ -42,8 +44,13 @@ fn set_mouse_capture(on: bool) -> std::io::Result<()> {
     }
 }
 
-/// Runs the UI until the user quits.
-pub async fn run(mut store: StoreHandle, system_name: &str, mouse: bool) -> Result<()> {
+/// Runs the UI until the user quits. Interface choices go to `selection`.
+pub async fn run(
+    mut store: StoreHandle,
+    system_name: &str,
+    mouse: bool,
+    selection: watch::Sender<InterfaceSelection>,
+) -> Result<()> {
     // `init` also installs a panic hook that restores the terminal, but it
     // leaves mouse capture on; wrap it so a panic releases the mouse first.
     let mut terminal = ratatui::try_init()?;
@@ -90,6 +97,9 @@ pub async fn run(mut store: StoreHandle, system_name: &str, mouse: bool) -> Resu
         if app.mouse != mouse_captured {
             mouse_captured = app.mouse;
             set_mouse_capture(mouse_captured)?;
+        }
+        if let Some(chosen) = app.selection_request.take() {
+            selection.send_replace(chosen);
         }
         let ids = app.retained_ids();
         if ids != retained {

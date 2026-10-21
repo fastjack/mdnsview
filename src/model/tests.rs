@@ -374,6 +374,58 @@ async fn system_records_held_until_removed() {
     assert!(snap(&store).devices.is_empty());
 }
 
+fn daemon_printer(store: &mut Store) {
+    store.ingest(rec(Source::System, "_ipp._tcp.local", ptr("P._ipp._tcp.local"), None));
+    store.ingest(rec(Source::System, "P._ipp._tcp.local", srv("p.local", 631), None));
+    store.ingest(rec(Source::System, "p.local", a(40), None));
+}
+
+#[tokio::test(start_paused = true)]
+async fn released_daemon_entry_goes_stale_not_left() {
+    let mut store = Store::new(TIMEOUT);
+    daemon_printer(&mut store);
+    store.ingest(Observation::SystemReleased {
+        instance: name("P._ipp._tcp.local"),
+        at: Instant::now(),
+    });
+    let s = snap(&store);
+    assert_eq!(s.devices[0].state, Liveness::Stale);
+    assert_eq!(s.services.values().next().unwrap().state, Liveness::Stale);
+
+    advance(Duration::from_secs(299)).await;
+    store.gc(Instant::now());
+    assert_eq!(snap(&store).devices.len(), 1, "kept until the device timeout");
+    advance(Duration::from_secs(2)).await;
+    store.gc(Instant::now());
+    assert!(snap(&store).devices.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn released_entry_with_live_wire_copy_stays_live() {
+    let mut store = Store::new(TIMEOUT);
+    daemon_printer(&mut store);
+    store.ingest(wire("P._ipp._tcp.local", srv("p.local", 631), 120));
+    store.ingest(wire("p.local", a(40), 120));
+    store.ingest(Observation::SystemReleased {
+        instance: name("P._ipp._tcp.local"),
+        at: Instant::now(),
+    });
+    let s = snap(&store);
+    assert_eq!(s.devices[0].state, Liveness::Live);
+    assert_eq!(s.services.values().next().unwrap().state, Liveness::Live);
+}
+
+#[tokio::test(start_paused = true)]
+async fn removed_daemon_entry_is_left() {
+    let mut store = Store::new(TIMEOUT);
+    daemon_printer(&mut store);
+    store.ingest(Observation::SystemRemoved {
+        instance: name("P._ipp._tcp.local"),
+        at: Instant::now(),
+    });
+    assert_eq!(snap(&store).devices[0].state, Liveness::Left);
+}
+
 #[tokio::test(start_paused = true)]
 async fn refinement_requested_for_daemon_only_instances() {
     let mut store = Store::new(TIMEOUT);

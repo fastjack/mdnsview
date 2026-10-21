@@ -26,6 +26,7 @@ from it.
 | `tab` | Switch the left pane between devices and service types |
 | `/` | Filter the left pane (`enter` applies, `esc` clears) |
 | `d` | Switch the details pane between the simple view and raw records |
+| `i` | Choose which network interfaces to use |
 | `m` | Turn mouse capture off / on |
 | `q` / `ctrl-c` | Quit |
 
@@ -44,6 +45,23 @@ The raw records view lists every record mDNS reported for the service and its
 host, with remaining and original TTL, cache-flush bit, source address,
 interface, which source reported it (`system`, `wire` or `both`) and when it
 was first and last seen.
+
+### Choosing interfaces
+
+On a machine with several networks (Wi-Fi and Ethernet, a VPN, a docker
+bridge), press `i` to choose which of them `mdnsview` uses. The picker lists
+every interface allowed by the `[interfaces]` configuration (see below), with
+its addresses. Check **All interfaces**, one interface, or several with
+`space`; `a` goes back to all, `enter` applies and `esc` cancels.
+
+Only the chosen interfaces are listened on and queried, and avahi results from
+other interfaces are ignored. Devices already found on an interface you
+deselect are no longer refreshed: they turn stale and disappear after the
+device timeout. Selecting the interface again brings avahi's entries back at
+once; other devices return as they answer. With **All interfaces** checked,
+interfaces that come up later are used automatically; a hand-picked set stays
+as it is. The status bar shows `1 of 3 interfaces` while the choice is
+narrowed. The choice is not saved: every start uses all interfaces.
 
 ### One device, several host names
 
@@ -105,7 +123,8 @@ mouse = true
 
 [interfaces]
 # Glob patterns of interfaces to use. Empty = every interface that is up,
-# multicast-capable and not loopback.
+# multicast-capable and not loopback. These patterns apply to the multicast
+# socket and to avahi results, and limit what the `i` picker offers.
 include = []
 # Glob patterns of interfaces to skip. Setting this replaces the default list.
 exclude = ["veth*"]

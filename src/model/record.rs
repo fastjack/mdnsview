@@ -1,6 +1,7 @@
 //! Source-independent representation of mDNS resource records.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -318,15 +319,49 @@ pub enum SourceState {
     Unavailable(String),
 }
 
+/// Which of the eligible interfaces the user wants discovery to use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum InterfaceSelection {
+    /// Every eligible interface, including ones that appear later.
+    #[default]
+    All,
+    /// Only the named interfaces, whether or not they currently exist.
+    Only(BTreeSet<String>),
+}
+
+impl InterfaceSelection {
+    pub fn includes(&self, name: &str) -> bool {
+        match self {
+            InterfaceSelection::All => true,
+            InterfaceSelection::Only(names) => names.contains(name),
+        }
+    }
+}
+
+/// An interface as shown to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceInfo {
+    pub name: String,
+    pub addresses: Vec<IpAddr>,
+}
+
 /// Messages from discovery sources to the store.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Observation {
     Record(ObservedRecord),
     /// The OS daemon no longer holds this service instance.
     SystemRemoved { instance: DnsName, at: Instant },
+    /// The daemon still holds this instance, but only on interfaces no
+    /// longer in use: stop holding it, without a goodbye.
+    SystemReleased { instance: DnsName, at: Instant },
     SourceStatus { source: Source, state: SourceState },
-    /// Names of the interfaces the wire backend currently uses.
-    Interfaces(Vec<String>),
+    /// The eligible interfaces, the names of those in use, and the
+    /// runtime selection that chose them.
+    Interfaces {
+        eligible: Vec<InterfaceInfo>,
+        active: Vec<String>,
+        selection: InterfaceSelection,
+    },
 }
 
 /// A request from the store for the wire backend to query a name.

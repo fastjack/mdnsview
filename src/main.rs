@@ -9,13 +9,14 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use config::Config;
-use model::record::{Observation, Source, SourceState};
+use model::record::{InterfaceSelection, Observation, Source, SourceState};
 use wire::backend::WireBackend;
 use wire::interfaces::Selector;
+use wire::monitor::Monitor;
 
 /// How long to wait for the OS daemon when it is the only possible source.
 const SYSTEM_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,8 +59,14 @@ async fn run(config: Config) -> Result<()> {
     let (query_tx, query_rx) = mpsc::unbounded_channel();
     let (mut store, _store_task) = model::store::spawn(config.device_timeout, Some(query_tx));
 
-    let selector = Selector::new(&config.interfaces)?;
-    let wire_error = match WireBackend::open(selector, config.ipv6, config.device_timeout) {
+    // The monitor runs whatever sources work: it also decides which
+    // interfaces' daemon results are used.
+    let (selection_tx, selection_rx) = watch::channel(InterfaceSelection::All);
+    let monitor = Monitor::new(Selector::new(&config.interfaces)?, selection_rx);
+    let (interfaces_tx, interfaces_rx) = watch::channel(monitor.initial());
+    tokio::spawn(monitor.run(interfaces_tx, store.observations.clone()));
+
+    let wire_error = match WireBackend::open(interfaces_rx.clone(), config.ipv6, config.device_timeout) {
         Ok(backend) => {
             tokio::spawn(backend.run(store.observations.clone(), query_rx));
             None
@@ -80,7 +87,7 @@ async fn run(config: Config) -> Result<()> {
 
     let system = backend::platform();
     let system_name = system.name();
-    tokio::spawn(system.run(store.observations.clone()));
+    tokio::spawn(system.run(store.observations.clone(), interfaces_rx));
 
     if let Some(wire_error) = wire_error {
         // Without our own socket the daemon is the only source: make sure it works.
@@ -104,5 +111,5 @@ async fn run(config: Config) -> Result<()> {
         }
     }
 
-    ui::run(store, system_name, config.mouse).await
+    ui::run(store, system_name, config.mouse, selection_tx).await
 }

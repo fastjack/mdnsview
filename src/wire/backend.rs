@@ -1,29 +1,29 @@
 //! The wire backend task: receives and decodes mDNS traffic, sends the
-//! scheduler's queries and follows interface changes.
+//! scheduler's queries and follows the interface monitor.
 
 use std::collections::BTreeMap;
 use std::future::pending;
 use std::io;
 use std::time::{Duration, SystemTime};
 
-use tokio::sync::mpsc;
-use tokio::time::{Instant, MissedTickBehavior, sleep_until};
+use tokio::sync::{mpsc, watch};
+use tokio::time::{Instant, sleep_until};
 use tracing::{debug, info, warn};
 
 use super::codec::{self, WireRecord};
-use super::interfaces::{Interface, Selector};
+use super::interfaces::Interface;
+use super::monitor::InterfaceSet;
 use super::scheduler::{Question, Scheduler};
-use super::sys::{self, MdnsSocket, Received};
+use super::sys::{MdnsSocket, Received};
 use crate::model::record::{Observation, ObservedRecord, QueryRequest, Source, SourceState};
 
-const INTERFACE_POLL: Duration = Duration::from_secs(5);
 const QUESTIONS_PER_PACKET: usize = 20;
 const KNOWN_ANSWERS_PER_PACKET: usize = 30;
 
 pub struct WireBackend {
     v4: Option<MdnsSocket>,
     v6: Option<MdnsSocket>,
-    selector: Selector,
+    interfaces: watch::Receiver<InterfaceSet>,
     scheduler: Scheduler,
     /// Joined interfaces by index.
     joined: BTreeMap<u32, Interface>,
@@ -31,7 +31,11 @@ pub struct WireBackend {
 
 impl WireBackend {
     /// Opens the sockets. Fails only if no socket at all can be opened.
-    pub fn open(selector: Selector, ipv6: bool, device_timeout: Duration) -> io::Result<Self> {
+    pub fn open(
+        interfaces: watch::Receiver<InterfaceSet>,
+        ipv6: bool,
+        device_timeout: Duration,
+    ) -> io::Result<Self> {
         let v4 = MdnsSocket::open_v4()
             .inspect_err(|e| warn!("IPv4 mDNS socket unavailable: {e}"));
         let v6 = if ipv6 {
@@ -49,7 +53,7 @@ impl WireBackend {
         Ok(Self {
             v4,
             v6,
-            selector,
+            interfaces,
             scheduler: Scheduler::new(Instant::now(), device_timeout),
             joined: BTreeMap::new(),
         })
@@ -59,21 +63,15 @@ impl WireBackend {
         self.v4.iter().chain(self.v6.iter())
     }
 
-    /// Joins and leaves multicast groups to match the current interfaces.
+    /// Joins and leaves multicast groups to match the interfaces in use.
     /// Returns true when the set of interfaces changed.
     fn sync_interfaces(&mut self) -> bool {
-        let all = match sys::list_interfaces() {
-            Ok(all) => all,
-            Err(e) => {
-                warn!("cannot list interfaces: {e}");
-                return false;
-            }
-        };
         let wanted: BTreeMap<u32, Interface> = self
-            .selector
-            .select(&all)
-            .into_iter()
-            .map(|i| (i.index, i))
+            .interfaces
+            .borrow_and_update()
+            .active
+            .iter()
+            .map(|i| (i.index, i.clone()))
             .collect();
         if wanted == self.joined {
             return false;
@@ -101,10 +99,6 @@ impl WireBackend {
         }
         self.joined = wanted;
         true
-    }
-
-    fn interface_names(&self) -> Vec<String> {
-        self.joined.values().map(|i| i.name.clone()).collect()
     }
 
     fn send_questions(&self, questions: &[Question], now: Instant) {
@@ -181,19 +175,16 @@ impl WireBackend {
             async move { tx.send(obs).await.is_ok() }
         };
         self.sync_interfaces();
-        if !send(Observation::Interfaces(self.interface_names())).await
-            || !send(Observation::SourceStatus {
-                source: Source::Wire,
-                state: SourceState::Active,
-            })
-            .await
+        if !send(Observation::SourceStatus {
+            source: Source::Wire,
+            state: SourceState::Active,
+        })
+        .await
         {
             return;
         }
 
-        let mut poll = tokio::time::interval(INTERFACE_POLL);
-        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        poll.tick().await;
+        let mut interfaces_open = true;
         let mut buf4 = vec![0u8; 9000];
         let mut buf6 = vec![0u8; 9000];
         let mut queries_open = true;
@@ -201,12 +192,11 @@ impl WireBackend {
         loop {
             let due = self.scheduler.next_due();
             let packets: Vec<Observation> = tokio::select! {
-                _ = poll.tick() => {
-                    if self.sync_interfaces() {
+                changed = self.interfaces.changed(), if interfaces_open => {
+                    if changed.is_err() {
+                        interfaces_open = false;
+                    } else if self.sync_interfaces() {
                         self.scheduler.restart_enumeration(Instant::now());
-                        if !send(Observation::Interfaces(self.interface_names())).await {
-                            return;
-                        }
                     }
                     continue;
                 }
@@ -269,6 +259,8 @@ async fn sleep_or_pending(due: Option<Instant>) {
 mod tests {
     use super::*;
     use crate::config::InterfaceConfig;
+    use crate::wire::interfaces::Selector;
+    use crate::wire::monitor::Monitor;
 
     /// Runs against the real network: `cargo test live_wire -- --ignored --nocapture`.
     /// Set MDNSVIEW_LIVE_SECS to change the duration (default 6).
@@ -279,9 +271,12 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(6);
-        let selector = Selector::new(&InterfaceConfig::default()).unwrap();
-        let backend = WireBackend::open(selector, true, Duration::from_secs(300)).unwrap();
+        let (_selection, selection_rx) = watch::channel(Default::default());
+        let monitor = Monitor::new(Selector::new(&InterfaceConfig::default()).unwrap(), selection_rx);
+        let (sets_tx, sets_rx) = watch::channel(monitor.initial());
+        let backend = WireBackend::open(sets_rx, true, Duration::from_secs(300)).unwrap();
         let (tx, mut rx) = mpsc::channel(4096);
+        tokio::spawn(monitor.run(sets_tx, tx.clone()));
         let (_qtx, qrx) = mpsc::unbounded_channel();
         let task = tokio::spawn(backend.run(tx, qrx));
         let deadline = Instant::now() + Duration::from_secs(secs);

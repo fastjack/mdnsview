@@ -7,7 +7,9 @@ use std::time::{Duration, SystemTime};
 
 use tokio::time::Instant;
 
-use super::record::{DnsName, RData, RecordKey, SourceState, Sources, rtype};
+use super::record::{
+    DnsName, InterfaceInfo, InterfaceSelection, RData, RecordKey, SourceState, Sources, rtype,
+};
 use super::service_names;
 use super::store::StoredRecord;
 
@@ -25,7 +27,11 @@ pub enum Liveness {
 pub struct Status {
     pub system: SourceState,
     pub wire: SourceState,
-    pub interfaces: Vec<String>,
+    /// Names of the interfaces in use.
+    pub active: Vec<String>,
+    /// Interfaces passing the configured rules, sorted by name.
+    pub eligible: Vec<InterfaceInfo>,
+    pub selection: InterfaceSelection,
 }
 
 impl Default for Status {
@@ -33,7 +39,9 @@ impl Default for Status {
         Self {
             system: SourceState::Starting,
             wire: SourceState::Starting,
-            interfaces: Vec::new(),
+            active: Vec::new(),
+            eligible: Vec::new(),
+            selection: InterfaceSelection::All,
         }
     }
 }

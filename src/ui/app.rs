@@ -1,5 +1,7 @@
 //! UI state and key handling, independent of rendering.
 
+use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use ratatui::crossterm::event::{
@@ -7,6 +9,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
+use crate::model::record::InterfaceSelection;
 use crate::model::snapshot::{Device, Service, ServiceType, Snapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,29 @@ impl HitMap {
     }
 }
 
+/// State of the open interface picker; applied only on `enter`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Picker {
+    pub cursor: usize,
+    /// "All interfaces" is checked.
+    pub all: bool,
+    /// Checked single interfaces; empty while `all` is set.
+    pub checked: BTreeSet<String>,
+    /// The user tried to apply with nothing checked.
+    pub error: bool,
+}
+
+/// One row of the interface picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerRow {
+    /// `None` for "All interfaces".
+    pub name: Option<String>,
+    pub addresses: Vec<IpAddr>,
+    pub checked: bool,
+    /// Checked, but not currently eligible (down or gone).
+    pub unavailable: bool,
+}
+
 /// An entry of the left pane.
 pub enum LeftItem<'a> {
     Device(&'a Device),
@@ -93,6 +119,10 @@ pub struct App {
     pub quit: bool,
     /// Whether mouse capture should be on.
     pub mouse: bool,
+    /// The interface picker, while it is open.
+    pub picker: Option<Picker>,
+    /// A selection the user applied, for the event loop to hand to discovery.
+    pub selection_request: Option<InterfaceSelection>,
 }
 
 impl App {
@@ -110,6 +140,8 @@ impl App {
             detail_scroll: 0,
             quit: false,
             mouse: true,
+            picker: None,
+            selection_request: None,
         };
         app.fix_selection();
         app
@@ -265,6 +297,10 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.picker.is_some() {
+            self.on_picker_key(key.code);
+            return;
+        }
         if self.editing_filter {
             match key.code {
                 KeyCode::Esc => {
@@ -284,6 +320,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('m') => self.mouse = !self.mouse,
+            KeyCode::Char('i') => self.open_picker(),
             KeyCode::Char('/') => self.editing_filter = true,
             KeyCode::Esc => {
                 self.filter.clear();
@@ -317,8 +354,98 @@ impl App {
         }
     }
 
+    fn open_picker(&mut self) {
+        self.picker = Some(match &self.snapshot.status.selection {
+            InterfaceSelection::All => Picker {
+                all: true,
+                ..Picker::default()
+            },
+            InterfaceSelection::Only(names) => Picker {
+                checked: names.clone(),
+                ..Picker::default()
+            },
+        });
+    }
+
+    /// The picker's rows: "All interfaces", then the eligible interfaces and
+    /// any checked ones that are not eligible right now, sorted by name.
+    pub fn picker_rows(&self) -> Vec<PickerRow> {
+        let Some(picker) = &self.picker else {
+            return Vec::new();
+        };
+        let eligible = &self.snapshot.status.eligible;
+        let mut names: BTreeSet<&str> = eligible.iter().map(|i| i.name.as_str()).collect();
+        names.extend(picker.checked.iter().map(String::as_str));
+        let mut rows = vec![PickerRow {
+            name: None,
+            addresses: Vec::new(),
+            checked: picker.all,
+            unavailable: false,
+        }];
+        rows.extend(names.into_iter().map(|name| {
+            let info = eligible.iter().find(|i| i.name == name);
+            PickerRow {
+                name: Some(name.to_string()),
+                addresses: info.map(|i| i.addresses.clone()).unwrap_or_default(),
+                checked: picker.checked.contains(name),
+                unavailable: info.is_none(),
+            }
+        }));
+        rows
+    }
+
+    fn on_picker_key(&mut self, code: KeyCode) {
+        let rows = self.picker_rows();
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        picker.cursor = picker.cursor.min(rows.len() - 1);
+        match code {
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Up | KeyCode::Char('k') => picker.cursor = picker.cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => picker.cursor = (picker.cursor + 1).min(rows.len() - 1),
+            KeyCode::Char('a') => {
+                picker.all = true;
+                picker.checked.clear();
+                picker.error = false;
+            }
+            KeyCode::Char(' ') => {
+                match &rows[picker.cursor].name {
+                    None if picker.all => picker.all = false,
+                    None => {
+                        picker.all = true;
+                        picker.checked.clear();
+                    }
+                    Some(name) => {
+                        if !picker.checked.remove(name) {
+                            picker.checked.insert(name.clone());
+                            picker.all = false;
+                        }
+                    }
+                }
+                picker.error = false;
+            }
+            KeyCode::Enter => {
+                if picker.all {
+                    self.selection_request = Some(InterfaceSelection::All);
+                } else if picker.checked.is_empty() {
+                    picker.error = true;
+                    return;
+                } else {
+                    self.selection_request = Some(InterfaceSelection::Only(picker.checked.clone()));
+                }
+                self.picker = None;
+            }
+            _ => {}
+        }
+    }
+
     /// Mouse clicks select and focus; the wheel acts on the pane under the pointer.
+    /// Ignored while the interface picker is open.
     pub fn on_mouse(&mut self, event: MouseEvent, hits: &HitMap) {
+        if self.picker.is_some() {
+            return;
+        }
         let pos = Position::new(event.column, event.row);
         let Some(pane) = hits.pane_at(pos) else {
             return;

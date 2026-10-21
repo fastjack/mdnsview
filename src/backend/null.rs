@@ -1,9 +1,10 @@
 //! A backend for platforms without a supported mDNS daemon.
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::{BoxFuture, SystemBackend};
 use crate::model::record::{Observation, Source, SourceState};
+use crate::wire::monitor::InterfaceSet;
 
 // Used on platforms without a daemon backend, and in tests.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
@@ -14,7 +15,11 @@ impl SystemBackend for NullBackend {
         "none"
     }
 
-    fn run(self: Box<Self>, observations: mpsc::Sender<Observation>) -> BoxFuture {
+    fn run(
+        self: Box<Self>,
+        observations: mpsc::Sender<Observation>,
+        _interfaces: watch::Receiver<InterfaceSet>,
+    ) -> BoxFuture {
         Box::pin(async move {
             let _ = observations
                 .send(Observation::SourceStatus {
@@ -36,7 +41,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn store_runs_with_null_backend() {
         let (mut handle, _task) = spawn(Duration::from_secs(300), None);
-        Box::new(NullBackend).run(handle.observations.clone()).await;
+        let (_sets, sets_rx) = tokio::sync::watch::channel(InterfaceSet::default());
+        Box::new(NullBackend).run(handle.observations.clone(), sets_rx).await;
         tokio::time::advance(Duration::from_millis(300)).await;
         handle.snapshots.changed().await.unwrap();
         let status: Status = handle.snapshots.borrow().status.clone();

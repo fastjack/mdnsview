@@ -6,6 +6,7 @@ use anyhow::Result;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::config::InterfaceConfig;
+use crate::model::record::{InterfaceInfo, InterfaceSelection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Interface {
@@ -44,6 +45,30 @@ impl Selector {
             .collect();
         selected.sort_by(|a, b| a.name.cmp(&b.name));
         selected
+    }
+
+    /// The eligible interfaces the runtime selection keeps. Never adds an
+    /// interface that is not eligible.
+    pub fn active(eligible: &[Interface], selection: &InterfaceSelection) -> Vec<Interface> {
+        eligible
+            .iter()
+            .filter(|i| selection.includes(&i.name))
+            .cloned()
+            .collect()
+    }
+}
+
+impl Interface {
+    pub fn info(&self) -> InterfaceInfo {
+        InterfaceInfo {
+            name: self.name.clone(),
+            addresses: self
+                .v4
+                .iter()
+                .map(|a| (*a).into())
+                .chain(self.v6.iter().map(|a| (*a).into()))
+                .collect(),
+        }
     }
 }
 
@@ -123,6 +148,50 @@ mod tests {
             exclude: vec!["docker*".into()],
         };
         assert_eq!(names(config), vec!["veth1a2b", "wlan0"]);
+    }
+
+    fn only(names: &[&str]) -> InterfaceSelection {
+        InterfaceSelection::Only(names.iter().map(|n| n.to_string()).collect())
+    }
+
+    fn active_names(eligible: &[Interface], selection: &InterfaceSelection) -> Vec<String> {
+        Selector::active(eligible, selection).into_iter().map(|i| i.name).collect()
+    }
+
+    fn eligible() -> Vec<Interface> {
+        Selector::new(&InterfaceConfig::default()).unwrap().select(&host())
+    }
+
+    #[test]
+    fn active_all_keeps_every_eligible_interface() {
+        assert_eq!(active_names(&eligible(), &InterfaceSelection::All), vec!["docker0", "wlan0"]);
+    }
+
+    #[test]
+    fn active_only_keeps_named_interfaces() {
+        assert_eq!(active_names(&eligible(), &only(&["wlan0"])), vec!["wlan0"]);
+    }
+
+    #[test]
+    fn active_skips_absent_selected_interface() {
+        assert_eq!(active_names(&eligible(), &only(&["wlan0", "enp3s0"])), vec!["wlan0"]);
+    }
+
+    #[test]
+    fn new_interface_follows_all_but_not_only() {
+        let mut all = host();
+        all.push(iface("enp3s0", 5));
+        let eligible = Selector::new(&InterfaceConfig::default()).unwrap().select(&all);
+        assert_eq!(
+            active_names(&eligible, &InterfaceSelection::All),
+            vec!["docker0", "enp3s0", "wlan0"]
+        );
+        assert_eq!(active_names(&eligible, &only(&["wlan0"])), vec!["wlan0"]);
+    }
+
+    #[test]
+    fn active_never_returns_ineligible_interface() {
+        assert!(active_names(&eligible(), &only(&["veth1a2b", "lo"])).is_empty());
     }
 
     #[test]

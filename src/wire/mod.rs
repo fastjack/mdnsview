@@ -3,5 +3,6 @@
 pub mod backend;
 pub mod codec;
 pub mod interfaces;
+pub mod monitor;
 pub mod scheduler;
 pub mod sys;

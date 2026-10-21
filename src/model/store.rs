@@ -77,7 +77,11 @@ impl Store {
         match obs {
             Observation::Record(rec) => self.ingest_record(rec),
             Observation::SystemRemoved { instance, at } => {
-                self.system_removed(&instance, at);
+                self.release_instance(&instance, at, true);
+                Vec::new()
+            }
+            Observation::SystemReleased { instance, at } => {
+                self.release_instance(&instance, at, false);
                 Vec::new()
             }
             Observation::SourceStatus { source, state } => {
@@ -87,8 +91,10 @@ impl Store {
                 }
                 Vec::new()
             }
-            Observation::Interfaces(names) => {
-                self.status.interfaces = names;
+            Observation::Interfaces { eligible, active, selection } => {
+                self.status.eligible = eligible;
+                self.status.active = active;
+                self.status.selection = selection;
                 Vec::new()
             }
         }
@@ -219,7 +225,9 @@ impl Store {
         vec![QueryRequest { name, rtypes }]
     }
 
-    fn system_removed(&mut self, instance: &DnsName, at: Instant) {
+    /// The daemon no longer holds `instance`: removed by the daemon
+    /// (`goodbye`), or released because its interfaces are no longer in use.
+    fn release_instance(&mut self, instance: &DnsName, at: Instant, goodbye: bool) {
         let type_name = instance.parent();
         let mut keys: Vec<RecordKey> = self.keys_owned(instance);
         keys.extend(
@@ -232,7 +240,7 @@ impl Store {
             if let RData::Srv { target, .. } = &k.data {
                 hosts.push(target.clone());
             }
-            self.release_system(k, at);
+            self.release_system(k, at, goodbye);
         }
         // Address records stay held while another held SRV still points at the host.
         for host in hosts {
@@ -242,20 +250,20 @@ impl Store {
             if !still_used {
                 for k in self.keys_owned(&host) {
                     if k.data.address().is_some() {
-                        self.release_system(&k, at);
+                        self.release_system(&k, at, goodbye);
                     }
                 }
             }
         }
     }
 
-    fn release_system(&mut self, key: &RecordKey, at: Instant) {
+    fn release_system(&mut self, key: &RecordKey, at: Instant, goodbye: bool) {
         if let Some(r) = self.records.get_mut(key)
             && r.held_by_system
         {
             r.held_by_system = false;
             r.last_seen = r.last_seen.max(at);
-            if !r.expires.is_some_and(|e| e > at) {
+            if goodbye && !r.expires.is_some_and(|e| e > at) {
                 r.goodbye = Some(at);
             }
         }
