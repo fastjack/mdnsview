@@ -355,14 +355,20 @@ fn raw_records(records: &[RecordView]) -> Vec<Line<'static>> {
 /// Local wall-clock time as HH:MM:SS.
 pub fn clock(t: SystemTime) -> String {
     let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as libc::time_t;
-    // SAFETY: `localtime_r` writes only into the provided `tm`.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let ok = unsafe { !libc::localtime_r(&secs, &mut tm).is_null() };
-    if ok {
-        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
-    } else {
-        "--:--:--".to_string()
+    match localtime(secs) {
+        Some(tm) => format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
+        None => "--:--:--".to_string(),
     }
+}
+
+fn localtime(secs: libc::time_t) -> Option<libc::tm> {
+    // SAFETY: both functions write only into the provided `tm`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
+    let ok = unsafe { !libc::localtime_r(&secs, &mut tm).is_null() };
+    #[cfg(windows)]
+    let ok = unsafe { libc::localtime_s(&mut tm, &secs) == 0 };
+    ok.then_some(tm)
 }
 
 /// The interface picker, centred over the panes.

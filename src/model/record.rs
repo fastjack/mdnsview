@@ -312,6 +312,11 @@ impl ObservedRecord {
     }
 }
 
+/// Reason the wire source reports when macOS's Local Network privacy
+/// setting blocks its multicast traffic.
+pub const LOCAL_NETWORK_BLOCKED: &str = "blocked by macOS Local Network permission: allow the app \
+     that starts mdnsview in System Settings › Privacy & Security › Local Network";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceState {
     Starting,
@@ -362,6 +367,9 @@ pub enum Observation {
         active: Vec<String>,
         selection: InterfaceSelection,
     },
+    /// Whether the wire source hears nothing from other hosts although its
+    /// queries go out (Windows only; see the wire backend).
+    WireSilent(bool),
 }
 
 /// A request from the store for the wire backend to query a name.

@@ -1,7 +1,4 @@
-//! Platform-specific socket and interface code (Unix / Linux).
-//!
-//! Everything that differs between operating systems lives here, so a
-//! Windows implementation can replace this module later.
+//! Socket and interface code for Unix: Linux and macOS.
 
 use std::collections::BTreeMap;
 use std::io::{self, IoSliceMut};
@@ -14,11 +11,8 @@ use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg, 
 use socket2::{Domain, InterfaceIndexOrAddress, Protocol, Socket, Type};
 use tokio::io::unix::AsyncFd;
 
-use super::interfaces::Interface;
-
-pub const MDNS_PORT: u16 = 5353;
-pub const GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
-pub const GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
+use super::{GROUP_V4, GROUP_V6, MDNS_PORT, Received};
+use crate::wire::interfaces::Interface;
 
 /// Lists all interfaces with their flags and addresses.
 pub fn list_interfaces() -> io::Result<Vec<Interface>> {
@@ -54,13 +48,6 @@ pub struct MdnsSocket {
     v6: bool,
 }
 
-/// A received datagram.
-pub struct Received {
-    pub len: usize,
-    pub src: IpAddr,
-    pub ifindex: u32,
-}
-
 impl MdnsSocket {
     pub fn open_v4() -> io::Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -68,6 +55,8 @@ impl MdnsSocket {
         socket.set_multicast_ttl_v4(255)?;
         socket.set_multicast_loop_v4(true)?;
         // Only deliver groups joined by this socket, not by others on the host.
+        // BSD-derived stacks such as macOS already behave this way.
+        #[cfg(target_os = "linux")]
         socket.set_multicast_all_v4(false)?;
         setsockopt(&socket, sockopt::Ipv4PacketInfo, &true).map_err(io::Error::from)?;
         socket.bind(&SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())?;
@@ -103,7 +92,7 @@ impl MdnsSocket {
         } else {
             self.fd
                 .get_ref()
-                .join_multicast_v4_n(&GROUP_V4, &InterfaceIndexOrAddress::Index(iface.index))
+                .join_multicast_v4_n(&GROUP_V4, &v4_membership(iface)?)
         }
     }
 
@@ -113,7 +102,7 @@ impl MdnsSocket {
         } else {
             self.fd
                 .get_ref()
-                .leave_multicast_v4_n(&GROUP_V4, &InterfaceIndexOrAddress::Index(iface.index))
+                .leave_multicast_v4_n(&GROUP_V4, &v4_membership(iface)?)
         }
     }
 
@@ -144,11 +133,28 @@ impl MdnsSocket {
     }
 }
 
+/// How to name the interface in an IPv4 membership request.
+///
+/// Linux accepts the interface index (`ip_mreqn`). macOS does not reliably
+/// honour it, so the interface's first IPv4 address is used there instead.
+fn v4_membership(iface: &Interface) -> io::Result<InterfaceIndexOrAddress> {
+    if cfg!(target_os = "macos") {
+        let addr = iface.v4.first().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::AddrNotAvailable, "interface has no IPv4 address")
+        })?;
+        Ok(InterfaceIndexOrAddress::Address(*addr))
+    } else {
+        Ok(InterfaceIndexOrAddress::Index(iface.index))
+    }
+}
+
 fn share_port(socket: &Socket) -> io::Result<()> {
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)
 }
 
+// `ipi_ifindex` is a `c_int` on Linux and a `c_uint` on macOS.
+#[allow(clippy::unnecessary_cast)]
 fn recv_with_ifindex(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<Received> {
     let mut cmsg = nix::cmsg_space!(libc::in6_pktinfo);
     let mut iov = [IoSliceMut::new(buf)];

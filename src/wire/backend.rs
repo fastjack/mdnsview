@@ -1,22 +1,30 @@
 //! The wire backend task: receives and decodes mDNS traffic, sends the
 //! scheduler's queries and follows the interface monitor.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::pending;
 use std::io;
+use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::{mpsc, watch};
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, MissedTickBehavior, sleep_until};
 use tracing::{debug, info, warn};
 
 use super::codec::{self, WireRecord};
 use super::interfaces::Interface;
 use super::monitor::InterfaceSet;
 use super::scheduler::{Question, Scheduler};
-use super::sys::{MdnsSocket, Received};
-use crate::model::record::{Observation, ObservedRecord, QueryRequest, Source, SourceState};
+use super::sys::{self, MdnsSocket, Received};
+use crate::model::record::{
+    LOCAL_NETWORK_BLOCKED, Observation, ObservedRecord, QueryRequest, Source, SourceState,
+};
 
+/// How often the host's own addresses are refreshed and silence is checked.
+const HOUSEKEEPING: Duration = Duration::from_secs(5);
+/// How long the wire source may hear no other host, after its first query,
+/// before it reports itself silent.
+const SILENCE: Duration = Duration::from_secs(15);
 const QUESTIONS_PER_PACKET: usize = 20;
 const KNOWN_ANSWERS_PER_PACKET: usize = 30;
 
@@ -27,6 +35,11 @@ pub struct WireBackend {
     scheduler: Scheduler,
     /// Joined interfaces by index.
     joined: BTreeMap<u32, Interface>,
+    /// Addresses of every interface on the host, to tell our own packets
+    /// from other hosts'.
+    own: HashSet<IpAddr>,
+    first_send: Option<Instant>,
+    last_foreign: Option<Instant>,
 }
 
 impl WireBackend {
@@ -56,11 +69,28 @@ impl WireBackend {
             interfaces,
             scheduler: Scheduler::new(Instant::now(), device_timeout),
             joined: BTreeMap::new(),
+            own: HashSet::new(),
+            first_send: None,
+            last_foreign: None,
         })
     }
 
     fn sockets(&self) -> impl Iterator<Item = &MdnsSocket> {
         self.v4.iter().chain(self.v6.iter())
+    }
+
+    /// Records the addresses of every interface on the host, not only the
+    /// ones in use, so our own packets are never taken for another host's.
+    fn refresh_own_addresses(&mut self) {
+        match sys::list_interfaces() {
+            Ok(all) => {
+                self.own = all
+                    .iter()
+                    .flat_map(|i| i.v4.iter().map(|&a| IpAddr::V4(a)).chain(i.v6.iter().map(|&a| IpAddr::V6(a))))
+                    .collect();
+            }
+            Err(e) => warn!("cannot list interfaces: {e}"),
+        }
     }
 
     /// Joins and leaves multicast groups to match the interfaces in use.
@@ -101,7 +131,10 @@ impl WireBackend {
         true
     }
 
-    fn send_questions(&self, questions: &[Question], now: Instant) {
+    /// Sends the questions on every joined interface and returns the result
+    /// of each send attempt.
+    fn send_questions(&self, questions: &[Question], now: Instant) -> Vec<io::Result<()>> {
+        let mut results = Vec::new();
         for chunk in questions.chunks(QUESTIONS_PER_PACKET) {
             let mut known = self.scheduler.known_answers(chunk, now);
             known.truncate(KNOWN_ANSWERS_PER_PACKET);
@@ -118,13 +151,16 @@ impl WireBackend {
                     if !has_address {
                         continue;
                     }
-                    if let Err(e) = s.send_to_group(&bytes, iface) {
+                    let result = s.send_to_group(&bytes, iface);
+                    if let Err(e) = &result {
                         debug!("send on {} ({}) failed: {e}", iface.name, ipv(s));
                     }
+                    results.push(result);
                 }
             }
             debug!("sent {} questions, {} known answers", chunk.len(), known.len());
         }
+        results
     }
 
     /// Turns a received datagram into observations.
@@ -132,6 +168,9 @@ impl WireBackend {
         let Some(iface) = self.joined.get(&rx.ifindex) else {
             return Vec::new(); // not one of our interfaces
         };
+        if !self.own.contains(&rx.src) {
+            self.last_foreign = Some(Instant::now());
+        }
         let iface_name = iface.name.clone();
         let decoded = match codec::decode(bytes) {
             Ok(d) => d,
@@ -174,6 +213,7 @@ impl WireBackend {
             let tx = observations.clone();
             async move { tx.send(obs).await.is_ok() }
         };
+        self.refresh_own_addresses();
         self.sync_interfaces();
         if !send(Observation::SourceStatus {
             source: Source::Wire,
@@ -185,9 +225,14 @@ impl WireBackend {
         }
 
         let mut interfaces_open = true;
+        let mut housekeeping = tokio::time::interval(HOUSEKEEPING);
+        housekeeping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        housekeeping.tick().await;
         let mut buf4 = vec![0u8; 9000];
         let mut buf6 = vec![0u8; 9000];
         let mut queries_open = true;
+        let mut blocked = false;
+        let mut silent = false;
 
         loop {
             let due = self.scheduler.next_due();
@@ -197,6 +242,23 @@ impl WireBackend {
                         interfaces_open = false;
                     } else if self.sync_interfaces() {
                         self.scheduler.restart_enumeration(Instant::now());
+                    }
+                    continue;
+                }
+                _ = housekeeping.tick() => {
+                    self.refresh_own_addresses();
+                    // Windows Firewall may drop all incoming mDNS to us.
+                    let now_silent = silence(self.first_send, self.last_foreign, Instant::now());
+                    if cfg!(windows) && now_silent != silent {
+                        silent = now_silent;
+                        if silent {
+                            warn!("no mDNS from other hosts for {}s: incoming traffic may be blocked", SILENCE.as_secs());
+                        } else {
+                            info!("mDNS from other hosts arrives again");
+                        }
+                        if !send(Observation::WireSilent(silent)).await {
+                            return;
+                        }
                     }
                     continue;
                 }
@@ -224,7 +286,26 @@ impl WireBackend {
                 _ = sleep_or_pending(due) => {
                     let now = Instant::now();
                     let questions = self.scheduler.take_due(now);
-                    self.send_questions(&questions, now);
+                    let results = self.send_questions(&questions, now);
+                    if self.first_send.is_none() && results.iter().any(Result::is_ok) {
+                        self.first_send = Some(now);
+                    }
+                    if cfg!(target_os = "macos")
+                        && let Some(now_blocked) = local_network_blocked(&results)
+                        && now_blocked != blocked
+                    {
+                        blocked = now_blocked;
+                        let state = if blocked {
+                            warn!("multicast sends fail: {LOCAL_NETWORK_BLOCKED}");
+                            SourceState::Unavailable(LOCAL_NETWORK_BLOCKED.into())
+                        } else {
+                            info!("multicast sends work again");
+                            SourceState::Active
+                        };
+                        if !send(Observation::SourceStatus { source: Source::Wire, state }).await {
+                            return;
+                        }
+                    }
                     continue;
                 }
             };
@@ -235,6 +316,29 @@ impl WireBackend {
             }
         }
     }
+}
+
+/// Whether the wire source counts as silent: queries have gone out for at
+/// least [`SILENCE`], and no other host was heard in that time.
+fn silence(first_send: Option<Instant>, last_foreign: Option<Instant>, now: Instant) -> bool {
+    let Some(first_send) = first_send else {
+        return false;
+    };
+    let since = last_foreign.map_or(first_send, |f| f.max(first_send));
+    now.duration_since(since) >= SILENCE
+}
+
+/// Whether a round of sends shows that macOS's Local Network privacy setting
+/// blocks us: every attempt failed with "no route to host". `None` when
+/// nothing was sent.
+fn local_network_blocked(results: &[io::Result<()>]) -> Option<bool> {
+    if results.is_empty() {
+        return None;
+    }
+    Some(results.iter().all(|r| {
+        r.as_ref()
+            .is_err_and(|e| e.raw_os_error() == Some(libc::EHOSTUNREACH))
+    }))
 }
 
 fn ipv(s: &MdnsSocket) -> &'static str {
@@ -261,6 +365,34 @@ mod tests {
     use crate::config::InterfaceConfig;
     use crate::wire::interfaces::Selector;
     use crate::wire::monitor::Monitor;
+
+    #[test]
+    fn silence_after_fifteen_seconds_without_other_hosts() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        // Nothing sent yet: never silent.
+        assert!(!silence(None, None, at(60)));
+        // Before 15 s, and after 15 s without traffic from other hosts.
+        assert!(!silence(Some(t0), None, at(14)));
+        assert!(silence(Some(t0), None, at(15)));
+        // Traffic at 10 s: silent only 15 s after that.
+        assert!(!silence(Some(t0), Some(at(10)), at(20)));
+        assert!(silence(Some(t0), Some(at(10)), at(25)));
+        // Traffic heard before the first send counts from the send.
+        assert!(!silence(Some(at(5)), Some(at(1)), at(19)));
+        assert!(silence(Some(at(5)), Some(at(1)), at(20)));
+    }
+
+    #[test]
+    fn local_network_blocked_only_when_every_send_is_unreachable() {
+        let unreachable = || Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH));
+        let other = || Err(io::Error::from_raw_os_error(libc::ENETDOWN));
+        assert_eq!(local_network_blocked(&[unreachable(), unreachable()]), Some(true));
+        assert_eq!(local_network_blocked(&[unreachable(), Ok(())]), Some(false));
+        assert_eq!(local_network_blocked(&[unreachable(), other()]), Some(false));
+        assert_eq!(local_network_blocked(&[Ok(()), Ok(())]), Some(false));
+        assert_eq!(local_network_blocked(&[]), None);
+    }
 
     /// Runs against the real network: `cargo test live_wire -- --ignored --nocapture`.
     /// Set MDNSVIEW_LIVE_SECS to change the duration (default 6).

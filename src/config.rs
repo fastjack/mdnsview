@@ -44,7 +44,11 @@ impl Default for InterfaceConfig {
     fn default() -> Self {
         Self {
             include: Vec::new(),
-            exclude: vec!["veth*".to_string()],
+            // Container veth pairs, and macOS links that never carry LAN
+            // mDNS: AWDL (awdl, llw), tunnels (utun) and anpi.
+            exclude: ["veth*", "awdl*", "llw*", "utun*", "anpi*"]
+                .map(String::from)
+                .to_vec(),
         }
     }
 }
@@ -123,7 +127,10 @@ mod tests {
         assert_eq!(c, Config::default());
         assert_eq!(c.device_timeout, Duration::from_secs(300));
         assert!(c.interfaces.include.is_empty());
-        assert_eq!(c.interfaces.exclude, vec!["veth*"]);
+        assert_eq!(
+            c.interfaces.exclude,
+            vec!["veth*", "awdl*", "llw*", "utun*", "anpi*"]
+        );
         assert!(c.ipv6);
         assert!(c.mouse);
     }
@@ -190,10 +197,14 @@ mod tests {
     #[test]
     fn readme_example_parses() {
         let readme = include_str!("../README.md");
-        let start = readme.find("```toml\n").expect("README has a toml example") + 8;
+        // Skip to the end of the fence line, which ends in CRLF in a Windows checkout.
+        let section = readme.find("## Configuration").expect("README has a configuration section");
+        let fence = section + readme[section..].find("```toml").expect("README has a toml example");
+        let start = fence + readme[fence..].find('\n').unwrap() + 1;
         let end = start + readme[start..].find("```").unwrap();
         let c = parse(&readme[start..end]).unwrap();
         assert_eq!(c.device_timeout, Duration::from_secs(300));
         assert!(c.mouse);
+        assert_eq!(c.interfaces.exclude, InterfaceConfig::default().exclude);
     }
 }

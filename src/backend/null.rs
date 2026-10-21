@@ -7,7 +7,7 @@ use crate::model::record::{Observation, Source, SourceState};
 use crate::wire::monitor::InterfaceSet;
 
 // Used on platforms without a daemon backend, and in tests.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(any(target_os = "linux", target_os = "macos", windows), allow(dead_code))]
 pub struct NullBackend;
 
 impl SystemBackend for NullBackend {

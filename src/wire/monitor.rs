@@ -54,6 +54,15 @@ impl Monitor {
         monitor
     }
 
+    /// The interface set of the default configuration on this host, for
+    /// live tests.
+    #[cfg(test)]
+    pub fn default_set() -> InterfaceSet {
+        let (_selection, selection) = watch::channel(InterfaceSelection::All);
+        let selector = Selector::new(&crate::config::InterfaceConfig::default()).unwrap();
+        Self::new(selector, selection).initial()
+    }
+
     /// The interface set at startup, known before any backend runs.
     pub fn initial(&self) -> InterfaceSet {
         self.current.clone()
